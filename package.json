@@ -1,0 +1,28 @@
+{
+  "name": "riksauji-pjk3",
+  "version": "1.0.0",
+  "description": "Sistem Dokumentasi Riksa Uji PJK3 - PWA Offline-First dengan Node.js Backend",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "keywords": [
+    "pjk3",
+    "riksauji",
+    "pwa",
+    "offline-first",
+    "dokumentasi-k3",
+    "k3"
+  ],
+  "author": "Ahli PJK3 Documentation System",
+  "license": "MIT",
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.18.2",
+    "puppeteer": "^25.10.0"
+  },
+  "engines": {
+    "node": ">=16.0.0"
+  }
+}

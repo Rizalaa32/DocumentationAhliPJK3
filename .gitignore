@@ -1,0 +1,25 @@
+# Dependencies
+node_modules/
+
+# Upload hasil sync (data lapangan — jangan di-push)
+uploads/
+
+# Environment & secrets
+.env
+.env.local
+.env.*.local
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# VS Code (opsional — hapus baris ini kalau mau share settings)
+# .vscode/
+
+# Logs
+*.log
+npm-debug.log*
+
+# Puppeteer cache
+.cache/

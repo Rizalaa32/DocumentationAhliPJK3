@@ -1,0 +1,37 @@
+{
+  "name": "Riksa Uji PJK3 — Dokumentasi Lapangan",
+  "short_name": "RiksaUji",
+  "description": "Sistem Dokumentasi Riksa Uji untuk Ahli PJK3. Offline-First PWA untuk engineer lapangan di area blank-spot sinyal.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait-primary",
+  "theme_color": "#1E3A5F",
+  "background_color": "#1E3A5F",
+  "lang": "id",
+  "dir": "ltr",
+  "categories": ["productivity", "utilities", "business"],
+  "icons": [
+    {
+      "src": "/icons/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "/icons/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ],
+  "shortcuts": [
+    {
+      "name": "Tambah Laporan Baru",
+      "short_name": "Laporan Baru",
+      "description": "Buat dokumentasi riksa uji baru",
+      "url": "/",
+      "icons": [{ "src": "/icons/icon-192.png", "sizes": "192x192" }]
+    }
+  ]
+}
