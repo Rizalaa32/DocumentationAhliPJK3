@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: riksauji-pjk3
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: node server.js
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 3000
+    healthCheckPath: /api/health
