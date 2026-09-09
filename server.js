@@ -154,7 +154,7 @@ function generateBase6Grid(blok, imagePaths, baseUrl) {
                  text-align:center; width:${Math.round(100 / (6 / colspan))}%;">
         ${imgSrc
           ? `<img src="${imgSrc}"
-                 style="max-width:100%; height:auto; display:block; margin:0 auto 8px;
+                 style="max-width:100%; max-height:350px; object-fit:contain; display:block; margin:0 auto 8px;
                         border:1px solid #E2E8F0; border-radius:4px;" alt="Foto">`
           : `<div style="width:100%; height:80px; background:#F0F4F8;
                          border:2px dashed #CBD5E1; border-radius:4px;

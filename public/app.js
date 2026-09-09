@@ -27,6 +27,7 @@ let db            = null;   // IndexedDB instance
 let blockCounter  = 0;      // Penomoran blok dokumentasi
 let isSyncing     = false;  // Guard flag untuk sync
 let swRegistration = null;  // Service Worker registration
+let editingId     = null;   // Menyimpan ID record yang sedang diedit
 
 // ════════════════════════════════════════════════════════════
 // IndexedDB MANAGER
@@ -68,23 +69,42 @@ function initDB() {
 }
 
 /**
- * Menyimpan satu record laporan baru ke IndexedDB dengan status "pending".
+ * Menyimpan satu record laporan baru ke IndexedDB dengan status "pending", atau update jika `existingId` diberikan.
  * @param {Object} data - Data form yang telah dikumpulkan
- * @returns {Promise<number>} ID record yang baru dibuat
+ * @param {number|null} existingId - ID record jika sedang diedit
+ * @returns {Promise<number>} ID record yang baru dibuat/diupdate
  */
-function saveLaporan(data) {
+function saveLaporan(data, existingId = null) {
   return new Promise((resolve, reject) => {
     const tx    = db.transaction([STORE_NAME], 'readwrite');
     const store = tx.objectStore(STORE_NAME);
-    const record = {
-      ...data,
-      status:    'pending',
-      createdAt: new Date().toISOString(),
-      syncedAt:  null
-    };
-    const req = store.add(record);
-    req.onsuccess = () => resolve(req.result);
-    req.onerror   = () => reject(req.error);
+    
+    if (existingId) {
+      const getReq = store.get(existingId);
+      getReq.onsuccess = () => {
+        const oldRecord = getReq.result || {};
+        const record = {
+          ...oldRecord,
+          ...data,
+          status: 'pending', // Set ulang jadi pending agar disinkronkan kembali
+          updatedAt: new Date().toISOString()
+        };
+        const putReq = store.put(record);
+        putReq.onsuccess = () => resolve(existingId);
+        putReq.onerror   = () => reject(putReq.error);
+      };
+      getReq.onerror = () => reject(getReq.error);
+    } else {
+      const record = {
+        ...data,
+        status:    'pending',
+        createdAt: new Date().toISOString(),
+        syncedAt:  null
+      };
+      const req = store.add(record);
+      req.onsuccess = () => resolve(req.result);
+      req.onerror   = () => reject(req.error);
+    }
   });
 }
 
@@ -140,6 +160,21 @@ function markAsSynced(id, pdfUrl = null) {
       putReq.onerror   = () => reject(putReq.error);
     };
     getReq.onerror = () => reject(getReq.error);
+  });
+}
+
+/**
+ * Menghapus record dari IndexedDB.
+ * @param {number} id - Primary key record
+ * @returns {Promise<void>}
+ */
+function deleteLaporan(id) {
+  return new Promise((resolve, reject) => {
+    const tx    = db.transaction([STORE_NAME], 'readwrite');
+    const store = tx.objectStore(STORE_NAME);
+    const req   = store.delete(id);
+    req.onsuccess = () => resolve();
+    req.onerror   = () => reject(req.error);
   });
 }
 
@@ -209,7 +244,6 @@ function compressImage(file) {
 
 function goToSlide1() {
   document.getElementById('slides-track').style.transform = 'translateX(0)';
-  document.getElementById('action-bar').classList.add('hidden');
   _setStep(1);
 }
 
@@ -245,8 +279,7 @@ function goToSlide2() {
     `${jenisObjek} — ${namaPerusahaan}\nNo. Seri: ${noSerie}`;
 
   // Transisi ke slide 2
-  document.getElementById('slides-track').style.transform = 'translateX(-100%)';
-  document.getElementById('action-bar').classList.remove('hidden');
+  document.getElementById('slides-track').style.transform = 'translateX(-50%)';
   _setStep(2);
 
   // Tambah blok pertama secara otomatis jika list masih kosong
@@ -605,16 +638,38 @@ async function saveToDevice() {
       return;
     }
 
-    const id = await saveLaporan(data);
-    showToast(`✅ Draf berhasil disimpan!\n(ID: ${id})`, 'success');
+    const id = await saveLaporan(data, editingId);
+    
+    if (editingId) {
+      showToast(`✅ Draf berhasil diperbarui!\n(ID: ${id})`, 'success');
+      editingId = null; // Reset mode editing
+      
+      // Kembalikan tombol ke teks awal
+      const btnSaveText = `
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+          <path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/>
+          <polyline points="17 21 17 13 7 13 7 21"/>
+          <polyline points="7 3 7 8 15 8"/>
+        </svg>
+        Simpan ke Perangkat
+      `;
+      btn.innerHTML = btnSaveText;
+    } else {
+      showToast(`✅ Draf berhasil disimpan!\n(ID: ${id})`, 'success');
+    }
+    
     await refreshPendingBadge();
 
   } catch (err) {
     console.error('[Save] Error:', err);
     showToast('❌ Gagal menyimpan. Coba lagi.', 'error');
   } finally {
-    btn.disabled  = false;
-    btn.innerHTML = orig;
+    if (!editingId) { // hanya kembalikan ke `orig` kalau bukan dari mode editing (karena mode editing me-reset ke teks default)
+      btn.disabled  = false;
+      btn.innerHTML = orig;
+    } else {
+      btn.disabled = false;
+    }
   }
 }
 
@@ -781,6 +836,38 @@ function closeDrawer() {
 
 function renderRecordsPanel(records) {
   const container = document.getElementById('records-list');
+  const headerDiv = document.querySelector('.drawer-header');
+  
+  // Periksa apakah ada record pending
+  const pendingCount = records ? records.filter(r => r.status === 'pending').length : 0;
+  
+  // Hapus tombol sync lama jika ada
+  const oldSyncBtn = document.getElementById('drawer-sync-btn');
+  if (oldSyncBtn) oldSyncBtn.remove();
+  
+  if (pendingCount > 0) {
+    const syncBtn = document.createElement('button');
+    syncBtn.id = 'drawer-sync-btn';
+    syncBtn.onclick = async () => {
+      await syncData();
+      const updatedRecords = await getAllLaporan();
+      renderRecordsPanel(updatedRecords);
+    };
+    syncBtn.innerHTML = `
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/>
+        <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>
+      </svg>
+      Sync (${pendingCount})
+    `;
+    syncBtn.style = `
+      display: inline-flex; align-items: center; gap: 5px;
+      background: var(--primary); color: #fff; border: none; border-radius: 6px;
+      padding: 6px 12px; font-size: 11px; font-weight: 700; cursor: pointer;
+      margin-right: 10px; margin-left: auto;
+    `;
+    headerDiv.insertBefore(syncBtn, document.querySelector('.drawer-close'));
+  }
 
   if (!records || records.length === 0) {
     container.innerHTML = `
@@ -816,7 +903,7 @@ function renderRecordsPanel(records) {
     // Tombol download PDF (hanya tampil untuk record synced yang punya pdfUrl)
     const pdfBtn = (rec.status === 'synced' && rec.pdfUrl)
       ? `<a href="${_esc(rec.pdfUrl)}" target="_blank" rel="noopener"
-            style="display:inline-flex; align-items:center; gap:5px; margin-top:6px;
+            style="display:inline-flex; align-items:center; gap:5px;
                    background:var(--primary); color:#fff; border-radius:6px;
                    padding:6px 12px; font-size:11px; font-weight:700;
                    text-decoration:none; transition:background 0.2s;"
@@ -831,6 +918,38 @@ function renderRecordsPanel(records) {
          </a>`
       : '';
 
+    // Tombol Sunting (Edit)
+    const editBtn = `
+      <button onclick="handleEditRecord(${rec.id})"
+              style="display:inline-flex; align-items:center; gap:5px;
+                     background:var(--primary-light); color:var(--primary); border:1px solid var(--primary-border); border-radius:6px;
+                     padding:5px 10px; font-size:11px; font-weight:700; cursor:pointer;
+                     transition:background 0.2s; white-space:nowrap;"
+              onmouseover="this.style.background='var(--primary)'; this.style.color='#fff';"
+              onmouseout="this.style.background='var(--primary-light)'; this.style.color='var(--primary)';">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+          <path d="M12 20h9"></path>
+          <path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"></path>
+        </svg>
+        Sunting
+      </button>`;
+
+    // Tombol Hapus (selalu ada)
+    const deleteBtn = `
+      <button onclick="handleDeleteRecord(${rec.id})"
+              style="display:inline-flex; align-items:center; gap:5px;
+                     background:var(--danger-bg); color:var(--danger); border:1px solid var(--danger-border); border-radius:6px;
+                     padding:5px 10px; font-size:11px; font-weight:700; cursor:pointer;
+                     transition:background 0.2s; white-space:nowrap;"
+              onmouseover="this.style.background='var(--danger)'; this.style.color='#fff';"
+              onmouseout="this.style.background='var(--danger-bg)'; this.style.color='var(--danger)';">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+          <polyline points="3 6 5 6 21 6"></polyline>
+          <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path>
+        </svg>
+        Hapus
+      </button>`;
+
     return `
     <div class="record-item" style="flex-direction:column; gap:6px;">
       <div style="display:flex; align-items:flex-start; gap:10px; width:100%;">
@@ -841,9 +960,120 @@ function renderRecordsPanel(records) {
         </div>
         <span class="record-badge ${statusClass}">${statusLabel}</span>
       </div>
-      ${pdfBtn}
+      <!-- Fitur Scroll Horizontal untuk Tombol -->
+      <div style="display:flex; gap:8px; margin-top:6px; overflow-x:auto; padding-bottom:4px;">
+        ${editBtn}
+        ${pdfBtn}
+        ${deleteBtn}
+      </div>
     </div>`;
   }).join('');
+}
+
+async function handleEditRecord(id) {
+  try {
+    const tx = db.transaction([STORE_NAME], 'readonly');
+    const store = tx.objectStore(STORE_NAME);
+    const getReq = store.get(id);
+
+    getReq.onsuccess = () => {
+      const record = getReq.result;
+      if (!record) {
+        showToast('Data tidak ditemukan.', 'error');
+        return;
+      }
+      
+      // 1. Populate Slide 1
+      document.getElementById('nama-perusahaan').value = record.namaPerusahaan || '';
+      document.getElementById('jenis-objek').value     = record.jenisObjek || 'Pesawat Angkat & Angkut';
+      document.getElementById('no-serie').value        = record.noSerie || '';
+      
+      // 2. Clear current blocks
+      const blockList = document.getElementById('block-list');
+      blockList.innerHTML = '';
+      blockCounter = 0;
+      
+      // 3. Populate Slide 2 Blocks
+      if (record.blokDokumentasi && Array.isArray(record.blokDokumentasi)) {
+        record.blokDokumentasi.forEach(blok => {
+           addBlock(); 
+           const bId = `blk-${blockCounter}`;
+           const blockEl = document.getElementById(bId);
+           
+           if (!blockEl) return;
+
+           const judulInput = blockEl.querySelector('.block-judul');
+           if (judulInput) judulInput.value = blok.judul || '';
+           
+           const layout = blok.layout || '1col';
+           const radio = blockEl.querySelector(`input[name="layout-${bId}"][value="${layout}"]`);
+           if (radio) {
+             radio.checked = true;
+             renderSlots(bId, layout);
+           }
+           
+           if (blok.slots && Array.isArray(blok.slots)) {
+             blok.slots.forEach((slotData, idx) => {
+               const slotEl   = document.getElementById(`s-${bId}-${idx}`);
+               const prevEl   = document.getElementById(`p-${bId}-${idx}`);
+               const holdEl   = document.getElementById(`h-${bId}-${idx}`);
+               const clearEl  = document.getElementById(`c-${bId}-${idx}`);
+               const ketEl    = document.querySelector(`#s-${bId}-${idx} .slot-keterangan`);
+               
+               if (slotEl && slotData.foto) {
+                 slotEl.dataset.base64 = slotData.foto;
+                 if (prevEl) {
+                   prevEl.src = slotData.foto;
+                   prevEl.classList.add('visible');
+                 }
+                 if (holdEl) holdEl.classList.add('hidden');
+                 if (clearEl) clearEl.classList.remove('hidden');
+               }
+               
+               if (ketEl && slotData.keterangan) {
+                 ketEl.value = slotData.keterangan;
+               }
+             });
+           }
+        });
+      }
+      
+      // 4. Set State & UI
+      editingId = id;
+      
+      const btnSave = document.getElementById('btn-save');
+      if (btnSave) {
+        btnSave.innerHTML = `
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+            <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"></path>
+            <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"></path>
+          </svg>
+          Perbarui Draf
+        `;
+      }
+      
+      closeDrawer();
+      goToSlide1();
+      showToast('✏️ Mode Penyuntingan Aktif. Silakan ubah data.', 'success');
+    };
+  } catch (err) {
+    console.error('Error in Edit:', err);
+    showToast('Gagal memuat data untuk disunting.', 'error');
+  }
+}
+
+async function handleDeleteRecord(id) {
+  if (!confirm('Apakah Anda yakin ingin menghapus data ini dari perangkat?')) return;
+  try {
+    await deleteLaporan(id);
+    showToast('Data berhasil dihapus.', 'success');
+    await refreshPendingBadge();
+    const records = await getAllLaporan();
+    renderRecordsPanel(records);
+  } catch (err) {
+    console.error('Delete error:', err);
+    showToast('Gagal menghapus data.', 'error');
+  }
 }
 
 /** HTML escape sederhana */
