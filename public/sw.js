@@ -2,7 +2,7 @@
 // Strategi: Cache-First untuk asset UI, bypass untuk API calls
 'use strict';
 
-const CACHE_NAME = 'riksauji-v7';
+const CACHE_NAME = 'riksauji-v15';
 const STATIC_ASSETS = [
   '/',
   '/index.html',

@@ -23,3 +23,10 @@ npm-debug.log*
 
 # Puppeteer cache
 .cache/
+
+# Test & Debug files
+test*
+*.zip
+debug.js
+*_server.js
+unzip.js

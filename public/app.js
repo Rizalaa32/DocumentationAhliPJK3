@@ -138,12 +138,13 @@ function getPendingLaporan() {
 }
 
 /**
- * Menandai satu record sebagai "synced", mengisi syncedAt, dan menyimpan URL PDF.
+ * Menandai satu record sebagai "synced", mengisi syncedAt, dan menyimpan URL PDF & Word.
  * @param {number} id      - Primary key record
  * @param {string|null} pdfUrl - URL download PDF dari server (opsional)
+ * @param {string|null} docxUrl - URL download Word dari server (opsional)
  * @returns {Promise<void>}
  */
-function markAsSynced(id, pdfUrl = null) {
+function markAsSynced(id, pdfUrl = null, docxUrl = null) {
   return new Promise((resolve, reject) => {
     const tx    = db.transaction([STORE_NAME], 'readwrite');
     const store = tx.objectStore(STORE_NAME);
@@ -155,6 +156,7 @@ function markAsSynced(id, pdfUrl = null) {
       record.status   = 'synced';
       record.syncedAt = new Date().toISOString();
       if (pdfUrl) record.pdfUrl = pdfUrl; // Simpan URL PDF dari server
+      if (docxUrl) record.docxUrl = docxUrl; // Simpan URL Word dari server
       const putReq = store.put(record);
       putReq.onsuccess = () => resolve();
       putReq.onerror   = () => reject(putReq.error);
@@ -239,16 +241,9 @@ function compressImage(file) {
 }
 
 // ════════════════════════════════════════════════════════════
-// NAVIGASI SLIDE
+// VALIDASI IDENTITAS
 // ════════════════════════════════════════════════════════════
-
-function goToSlide1() {
-  document.getElementById('slides-track').style.transform = 'translateX(0)';
-  _setStep(1);
-}
-
-function goToSlide2() {
-  // Validasi form slide 1
+function validateIdentitas() {
   const namaPerusahaan = document.getElementById('nama-perusahaan').value.trim();
   const jenisObjek     = document.getElementById('jenis-objek').value;
   const noSerie        = document.getElementById('no-serie').value.trim();
@@ -270,43 +265,11 @@ function goToSlide2() {
   });
 
   if (!valid) {
-    showToast('⚠️ Lengkapi semua field yang bertanda bintang (*).', 'warning');
-    return;
+    showToast('⚠️ Lengkapi semua field identitas yang bertanda bintang (*).', 'warning');
+    // Scroll ke atas agar user melihat field yang error
+    window.scrollTo({ top: 0, behavior: 'smooth' });
   }
-
-  // Tampilkan ringkasan identitas di slide 2
-  document.getElementById('summary-text').textContent =
-    `${jenisObjek} — ${namaPerusahaan}\nNo. Seri: ${noSerie}`;
-
-  // Transisi ke slide 2
-  document.getElementById('slides-track').style.transform = 'translateX(-50%)';
-  _setStep(2);
-
-  // Tambah blok pertama secara otomatis jika list masih kosong
-  const blockList = document.getElementById('block-list');
-  if (blockList.children.length === 0) {
-    addBlock();
-  }
-
-  // Scroll ke atas slide 2
-  window.scrollTo({ top: 0, behavior: 'smooth' });
-}
-
-/** Helper: perbarui tampilan step indicator */
-function _setStep(step) {
-  const s1   = document.getElementById('step-1');
-  const s2   = document.getElementById('step-2');
-  const line = document.getElementById('step-line');
-
-  if (step === 1) {
-    s1.className   = 'step-item active';
-    s2.className   = 'step-item';
-    line.className = 'step-line';
-  } else {
-    s1.className   = 'step-item done';
-    s2.className   = 'step-item active';
-    line.className = 'step-line done';
-  }
+  return valid;
 }
 
 // ════════════════════════════════════════════════════════════
@@ -615,6 +578,33 @@ function collectFormData() {
 // ════════════════════════════════════════════════════════════
 
 /**
+ * Mengosongkan form ke state awal untuk memulai laporan baru.
+ */
+function resetForm() {
+  document.getElementById('nama-perusahaan').value = '';
+  document.getElementById('jenis-objek').value = '';
+  document.getElementById('no-serie').value = '';
+  
+  const blockList = document.getElementById('block-list');
+  if (blockList) blockList.innerHTML = '';
+  blockCounter = 0;
+  editingId = null;
+
+  // Kembalikan tombol ke teks awal
+  const btnSave = document.getElementById('btn-save');
+  if (btnSave) {
+    btnSave.innerHTML = `
+      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/>
+        <polyline points="17 21 17 13 7 13 7 21"/>
+        <polyline points="7 3 7 8 15 8"/>
+      </svg>
+      Simpan Draf
+    `;
+  }
+}
+
+/**
  * Mengumpulkan data form dan menyimpannya ke IndexedDB sebagai draf "pending".
  */
 async function saveToDevice() {
@@ -625,13 +615,13 @@ async function saveToDevice() {
     btn.disabled = true;
     btn.innerHTML = '<div class="spinner dark"></div> Menyimpan…';
 
-    const data = collectFormData();
-
-    // Validasi minimal
-    if (!data.namaPerusahaan || !data.jenisObjek || !data.noSerie) {
-      showToast('⚠️ Data identitas belum lengkap.\nKembali ke Slide 1 dan lengkapi.', 'warning');
+    if (!validateIdentitas()) {
+      btn.disabled = false;
+      btn.innerHTML = orig;
       return;
     }
+
+    const data = collectFormData();
 
     if (data.blokDokumentasi.length === 0) {
       showToast('⚠️ Tambahkan minimal 1 blok dokumentasi.', 'warning');
@@ -641,22 +631,13 @@ async function saveToDevice() {
     const id = await saveLaporan(data, editingId);
     
     if (editingId) {
-      showToast(`✅ Draf berhasil diperbarui!\n(ID: ${id})`, 'success');
-      editingId = null; // Reset mode editing
-      
-      // Kembalikan tombol ke teks awal
-      const btnSaveText = `
-        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
-          <path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/>
-          <polyline points="17 21 17 13 7 13 7 21"/>
-          <polyline points="7 3 7 8 15 8"/>
-        </svg>
-        Simpan ke Perangkat
-      `;
-      btn.innerHTML = btnSaveText;
+      showToast(`✅ Draf berhasil diperbarui!`, 'success');
     } else {
-      showToast(`✅ Draf berhasil disimpan!\n(ID: ${id})`, 'success');
+      showToast(`✅ Draf berhasil disimpan!`, 'success');
     }
+    
+    // Kosongkan form setelah berhasil disimpan agar tidak ada duplikasi
+    resetForm();
     
     await refreshPendingBadge();
 
@@ -664,12 +645,8 @@ async function saveToDevice() {
     console.error('[Save] Error:', err);
     showToast('❌ Gagal menyimpan. Coba lagi.', 'error');
   } finally {
-    if (!editingId) { // hanya kembalikan ke `orig` kalau bukan dari mode editing (karena mode editing me-reset ke teks default)
-      btn.disabled  = false;
-      btn.innerHTML = orig;
-    } else {
-      btn.disabled = false;
-    }
+    // Jika resetForm() terpanggil, kita tidak perlu memulihkan teks awal karena resetForm menangani tombol
+    btn.disabled = false;
   }
 }
 
@@ -683,6 +660,23 @@ async function saveToDevice() {
  */
 async function syncData() {
   if (isSyncing) return; // Cegah double-tap
+  
+  // Auto-save form jika sedang diisi atau diedit, agar tidak perlu klik Simpan Draf manual
+  const data = collectFormData();
+  if (editingId || (data.namaPerusahaan && data.noSerie && data.blokDokumentasi.length > 0)) {
+    if (!data.namaPerusahaan || !data.noSerie) {
+      showToast('⚠️ Nama Perusahaan & No Seri wajib diisi sebelum Sinkronisasi!', 'error');
+      return;
+    }
+    try {
+      await saveLaporan(data, editingId);
+      // Jangan langsung panggil resetForm() di sini agar user bisa melihat form yang dia edit jika terjadi error sync,
+      // Tapi update editingId agar sinkron
+      editingId = null;
+    } catch (e) {
+      console.warn("Auto-save gagal:", e);
+    }
+  }
 
   // Cek konektivitas
   if (!navigator.onLine) {
@@ -724,12 +718,20 @@ async function syncData() {
     const result = await response.json();
     console.log('[Sync] Server response:', result);
 
-    // Tandai setiap record sebagai synced, sertakan pdfUrl jika tersedia
+    // Tandai setiap record sebagai synced, sertakan pdfUrl dan docxUrl jika tersedia
     await Promise.all(pending.map((rec) => {
       // Cari result yang cocok dengan clientId
       const serverResult = (result.results || []).find(r => r.clientId === rec.id);
-      const pdfUrl = serverResult?.pdfUrl || null;
-      return markAsSynced(rec.id, pdfUrl);
+      
+      // Jika server gagal memproses record ini, jangan tandai sebagai synced
+      if (!serverResult) {
+        console.warn(`Record ${rec.id} gagal diproses oleh server, tetap di status pending.`);
+        return Promise.resolve();
+      }
+
+      const pdfUrl = serverResult.pdfUrl || null;
+      const docxUrl = serverResult.docxUrl || null;
+      return markAsSynced(rec.id, pdfUrl, docxUrl);
     }));
     await refreshPendingBadge();
 
@@ -739,12 +741,15 @@ async function syncData() {
       .map(r => r.pdfUrl);
 
     if (pdfLinks.length > 0) {
-      showToast(`✅ ${pending.length} laporan tersinkron!\n📄 PDF siap diunduh — buka panel Data`, 'success', 5000);
+      showToast(`✅ ${pending.length} laporan tersinkron!\n📄 PDF & Word siap diunduh — buka panel Data`, 'success', 5000);
       // Simpan PDF URLs ke sessionStorage agar drawer dapat menampilkannya
       sessionStorage.setItem('lastSyncPdfUrls', JSON.stringify(pdfLinks));
     } else {
       showToast(`✅ ${pending.length} laporan berhasil disinkronisasi!`, 'success');
     }
+
+    // Reset form setelah sinkronisasi berhasil untuk menghindari duplikasi record jika user menekan save lagi
+    resetForm();
 
   } catch (err) {
     console.error('[Sync] Error:', err);
@@ -883,13 +888,18 @@ function renderRecordsPanel(records) {
     return;
   }
 
-  // Urutkan: terbaru di atas
+  // Urutkan: terbaru di atas (gunakan updatedAt jika ada)
   const sorted = [...records].sort(
-    (a, b) => new Date(b.createdAt) - new Date(a.createdAt)
+    (a, b) => {
+      const timeA = new Date(a.updatedAt || a.createdAt).getTime();
+      const timeB = new Date(b.updatedAt || b.createdAt).getTime();
+      return timeB - timeA;
+    }
   );
 
   container.innerHTML = sorted.map((rec) => {
-    const dt = new Date(rec.createdAt).toLocaleDateString('id-ID', {
+    const timestamp = rec.updatedAt || rec.createdAt;
+    const dt = new Date(timestamp).toLocaleDateString('id-ID', {
       day: 'numeric', month: 'short', year: 'numeric',
       hour: '2-digit', minute: '2-digit'
     });
@@ -915,6 +925,24 @@ function renderRecordsPanel(records) {
              <line x1="12" y1="15" x2="12" y2="3"/>
            </svg>
            Unduh PDF
+         </a>`
+      : '';
+
+    // Tombol download Word (hanya tampil untuk record synced yang punya docxUrl)
+    const docxBtn = (rec.status === 'synced' && rec.docxUrl)
+      ? `<a href="${_esc(rec.docxUrl)}" target="_blank" rel="noopener"
+            style="display:inline-flex; align-items:center; gap:5px;
+                   background:#2563EB; color:#fff; border-radius:6px;
+                   padding:6px 12px; font-size:11px; font-weight:700;
+                   text-decoration:none; transition:background 0.2s;"
+            onmouseover="this.style.background='#1E40AF'"
+            onmouseout="this.style.background='#2563EB'">
+           <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+             <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+             <polyline points="7 10 12 15 17 10"/>
+             <line x1="12" y1="15" x2="12" y2="3"/>
+           </svg>
+           Unduh Word
          </a>`
       : '';
 
@@ -964,6 +992,7 @@ function renderRecordsPanel(records) {
       <div style="display:flex; gap:8px; margin-top:6px; overflow-x:auto; padding-bottom:4px;">
         ${editBtn}
         ${pdfBtn}
+        ${docxBtn}
         ${deleteBtn}
       </div>
     </div>`;
@@ -1039,22 +1068,39 @@ async function handleEditRecord(id) {
       }
       
       // 4. Set State & UI
-      editingId = id;
-      
       const btnSave = document.getElementById('btn-save');
-      if (btnSave) {
-        btnSave.innerHTML = `
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
-            <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"></path>
-            <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"></path>
-          </svg>
-          Perbarui Draf
-        `;
+      
+      if (record.status === 'synced') {
+        // Jika sudah disinkronkan, kita clone record ini sebagai draf baru
+        editingId = null;
+        if (btnSave) {
+          btnSave.innerHTML = `
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+              <path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/>
+              <polyline points="17 21 17 13 7 13 7 21"/>
+              <polyline points="7 3 7 8 15 8"/>
+            </svg>
+            Simpan sbg Draf Baru
+          `;
+        }
+        showToast('✏️ Mode Salin Aktif. Data akan disimpan sebagai laporan baru.', 'success');
+      } else {
+        // Jika masih draf (pending), perbarui record yang sama
+        editingId = id;
+        if (btnSave) {
+          btnSave.innerHTML = `
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+              <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"></path>
+              <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"></path>
+            </svg>
+            Perbarui Draf
+          `;
+        }
+        showToast('✏️ Mode Penyuntingan Aktif. Silakan ubah data.', 'success');
       }
       
       closeDrawer();
-      goToSlide1();
-      showToast('✏️ Mode Penyuntingan Aktif. Silakan ubah data.', 'success');
+      window.scrollTo({ top: 0, behavior: 'smooth' });
     };
   } catch (err) {
     console.error('Error in Edit:', err);

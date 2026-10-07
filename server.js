@@ -7,6 +7,8 @@ const cors       = require('cors');
 const path       = require('path');
 const fs         = require('fs');
 const puppeteer  = require('puppeteer');
+const htmlDocx   = require('html-docx-js');
+const { Jimp }   = require('jimp');
 
 const app        = express();
 const PORT       = process.env.PORT || 3000;
@@ -74,7 +76,7 @@ function esc(str) {
  * @param {string} filename   - Nama file (misal: "foto_1.jpg")
  * @returns {string|null}     - Relative path (untuk URL) atau null jika gagal
  */
-function saveBase64Image(base64Str, dirPath, filename) {
+async function saveBase64Image(base64Str, dirPath, filename) {
   if (!base64Str || !base64Str.startsWith('data:image')) {
     return null;
   }
@@ -86,11 +88,21 @@ function saveBase64Image(base64Str, dirPath, filename) {
 
     // Buat direktori secara rekursif jika belum ada
     fs.mkdirSync(dirPath, { recursive: true });
-
     const filePath = path.join(dirPath, filename);
-    fs.writeFileSync(filePath, buffer);
 
-    return filePath;
+    // Proses gambar menggunakan Jimp: kecilkan dimensi agar proporsional maksimal 800x800
+    // Tanpa background tambahan agar bentuk aslinya tetap terjaga (bebas letterbox)
+    const image = await Jimp.read(buffer);
+    image.scaleToFit({ w: 800, h: 800 });
+    const processedBuffer = await image.getBuffer('image/jpeg');
+
+    fs.writeFileSync(filePath, processedBuffer);
+
+    return {
+      filePath,
+      width: image.bitmap.width,
+      height: image.bitmap.height
+    };
   } catch (err) {
     console.error('[SaveImage] Error:', err.message);
     return null;
@@ -129,38 +141,77 @@ function generateBase6Grid(blok, imagePaths, baseUrl) {
   const colspan = COLSPAN_MAP[blok.layout] || 6;
   const title   = esc(blok.judul || 'Pemeriksaan');
 
-  // Setiap blok dibungkus <tbody> dengan break-inside:avoid
-  // agar judul dan foto tidak terpisah di page break PDF
+  // Setiap blok dibungkus <table> terpisah dengan page-break-inside:avoid
+  // agar judul dan foto tidak terpisah di page break PDF/Word
   let rows = `
+  <table border="1" cellspacing="0" cellpadding="0" 
+         style="width:100%; table-layout:fixed; border-collapse:collapse;
+                font-family:Arial,Helvetica,sans-serif;
+                border:1px solid #CBD5E1; margin-bottom:20px;
+                page-break-inside:avoid; break-inside:avoid;">
   <tbody style="break-inside:avoid; page-break-inside:avoid;">
-    <tr>
+    <tr style="page-break-after:avoid; break-after:avoid; page-break-inside:avoid; break-inside:avoid;">
       <td colspan="6"
           style="padding:10px 14px; background-color:#1E3A5F; color:#FFFFFF;
                  font-weight:bold; font-size:13px; letter-spacing:0.02em;
-                 border:1px solid #CBD5E1;">
-        ${title}
+                 border:1px solid #CBD5E1;
+                 page-break-after:avoid; break-after:avoid;">
+        <p style="margin:0; page-break-after:avoid; break-after:avoid; page-break-inside:avoid; break-inside:avoid;">
+          ${title}
+        </p>
       </td>
     </tr>
-    <tr>`;
+    <tr style="page-break-before:avoid; break-before:avoid; page-break-inside:avoid; break-inside:avoid;">`;
 
   (blok.slots || []).forEach((slot, idx) => {
-    const relPath = imagePaths[idx];
-    const imgSrc  = relPath ? `${baseUrl}/uploads/${relPath}` : null;
-    const ket     = esc(slot.keterangan || '\u2014');
+    const imgData = imagePaths[idx];
+    let imgSrc = null;
+    let actualW = 0, actualH = 0;
+    if (imgData && imgData.relPath) {
+      const absPath = path.join(__dirname, 'uploads', imgData.relPath);
+      if (fs.existsSync(absPath)) {
+        const ext = path.extname(absPath).substring(1) || 'jpeg';
+        const b64 = fs.readFileSync(absPath).toString('base64');
+        imgSrc = `data:image/${ext};base64,${b64}`;
+        actualW = imgData.width || 0;
+        actualH = imgData.height || 0;
+      }
+    }
+    const ket = esc(slot.keterangan || '\u2014');
+
+    let maxW = 280;
+    let maxH = 280;
+    if (blok.layout === '1col') { maxW = 500; maxH = 400; }
+    if (blok.layout === '3col') { maxW = 180; maxH = 180; }
+
+    let finalW = maxW;
+    let finalH = maxH;
+    
+    if (actualW > 0 && actualH > 0) {
+      const ratioX = maxW / actualW;
+      const ratioY = maxH / actualH;
+      const ratio = Math.min(ratioX, ratioY);
+      
+      finalW = Math.round(actualW * ratio);
+      finalH = Math.round(actualH * ratio);
+    }
+
+    const tdWidth = (colspan / 6) * 100;
 
     rows += `
-      <td colspan="${colspan}"
+      <td colspan="${colspan}" width="${tdWidth}%"
           style="padding:10px; border:1px solid #CBD5E1; vertical-align:top;
-                 text-align:center; width:${Math.round(100 / (6 / colspan))}%;">
+                 text-align:center;">
         ${imgSrc
-          ? `<img src="${imgSrc}"
-                 style="max-width:100%; max-height:350px; object-fit:contain; display:block; margin:0 auto 8px;
-                        border:1px solid #E2E8F0; border-radius:4px;" alt="Foto">`
-          : `<div style="width:100%; height:80px; background:#F0F4F8;
-                         border:2px dashed #CBD5E1; border-radius:4px;
-                         display:flex; align-items:center; justify-content:center;
-                         margin-bottom:8px; color:#94A3B8; font-size:11px;">
-               Tidak ada foto
+          ? `<div style="width:${finalW}px; height:${finalH}px; overflow:hidden; margin:0 auto 8px;">
+               <img src="${imgSrc}" width="${finalW}" height="${finalH}"
+                    style="display:block; object-fit:cover;" alt="Foto">
+             </div>`
+          : `<div style="width:100px; height:100px; border:2px dashed #CBD5E1; 
+                         border-radius:8px; display:flex; align-items:center; 
+                         justify-content:center; margin:0 auto 8px; 
+                         background-color:#F8FAFC;">
+               <span style="color:#94A3B8; font-size:12px;">Kosong</span>
              </div>`
         }
         <p style="font-size:11.5px; color:#1E293B; text-align:left; margin:0;
@@ -173,7 +224,8 @@ function generateBase6Grid(blok, imagePaths, baseUrl) {
 
   rows += `
     </tr>
-  </tbody>`;
+  </tbody>
+  </table>`;
 
   return rows;
 }
@@ -183,12 +235,15 @@ function generateBase6Grid(blok, imagePaths, baseUrl) {
 // ════════════════════════════════════════════════════════════
 
 // Singleton browser instance — dibuka sekali, dipakai berkali-kali
-let _browser = null;
+let _browser;
 
 async function getBrowser() {
-  if (_browser && _browser.connected) return _browser;
+  if (_browser && _browser.isConnected()) return _browser;
+  if (_browser) {
+    try { await _browser.close(); } catch (e) {}
+  }
   _browser = await puppeteer.launch({
-    headless: true,   // v24+ gunakan boolean true (bukan 'new')
+    headless: 'new',
     args: [
       '--no-sandbox',
       '--disable-setuid-sandbox',
@@ -232,6 +287,26 @@ async function generatePDF(htmlContent, outputPath) {
     return outputPath;
   } finally {
     await page.close();
+  }
+}
+
+/**
+ * Menghasilkan file Word (.docx) dari string HTML menggunakan html-to-docx.
+ * 
+ * @param {string} htmlContent  - String HTML lengkap yang akan dirender
+ * @param {string} outputPath   - Absolute path file Docx tujuan
+ * @returns {Promise<string>}   - Path file Docx yang tersimpan
+ */
+async function generateDocx(htmlContent, outputPath) {
+  try {
+    const blob = htmlDocx.asBlob(htmlContent);
+    const arrayBuffer = await blob.arrayBuffer();
+    fs.writeFileSync(outputPath, Buffer.from(arrayBuffer));
+    console.log('[DOCX] Generated:', outputPath);
+    return outputPath;
+  } catch (err) {
+    console.error('[DOCX] Error generating docx:', err);
+    throw err;
   }
 }
 
@@ -320,29 +395,35 @@ app.post('/api/sync', async (req, res) => {
       const processedBlocks = [];
 
       // Proses setiap blok dokumentasi
-      (record.blokDokumentasi || []).forEach((blok, bIdx) => {
+      for (let bIdx = 0; bIdx < (record.blokDokumentasi || []).length; bIdx++) {
+        const blok = record.blokDokumentasi[bIdx];
         const blokDir         = path.join(recordDir, `blok_${bIdx + 1}`);
         const savedImagePaths = []; // Relative URL paths
 
         // Simpan setiap foto dalam blok
-        (blok.slots || []).forEach((slot, sIdx) => {
+        for (let sIdx = 0; sIdx < (blok.slots || []).length; sIdx++) {
+          const slot = blok.slots[sIdx];
           if (slot.foto && slot.foto.startsWith('data:image')) {
             const filename = `foto_${sIdx + 1}.jpg`;
-            const absPath  = saveBase64Image(slot.foto, blokDir, filename);
+            const savedImg = await saveBase64Image(slot.foto, blokDir, filename);
 
-            if (absPath) {
+            if (savedImg && savedImg.filePath) {
               // Buat relative path dari folder uploads/
               const relPath = path
                 .join(safeSerie, String(sessionTs), `blok_${bIdx + 1}`, filename)
                 .replace(/\\/g, '/'); // Normalisasi separator untuk URL
-              savedImagePaths.push(relPath);
+              savedImagePaths.push({
+                relPath,
+                width: savedImg.width,
+                height: savedImg.height
+              });
             } else {
               savedImagePaths.push(null);
             }
           } else {
             savedImagePaths.push(null); // Slot tanpa foto
           }
-        });
+        }
 
         // Generate Base-6 Grid HTML untuk blok ini
         const htmlGrid = generateBase6Grid(blok, savedImagePaths, baseUrl);
@@ -355,7 +436,7 @@ app.post('/api/sync', async (req, res) => {
           imagePaths:  savedImagePaths,
           htmlGrid
         });
-      });
+      }
 
       // Susun dokumen HTML lengkap untuk seluruh record ini
       const createdDate = record.createdAt
@@ -395,49 +476,63 @@ app.post('/api/sync', async (req, res) => {
   </p>
 
   <!-- IDENTITAS (justify kiri dengan lebar kolom seragam) -->
-  <table style="width:auto; margin-bottom:20px; border:none;">
+  <table style="margin-bottom:20px; border:none; line-height:1.2;">
     <tr>
-      <td style="width:155px; padding:2px 0; vertical-align:top;">Nama Perusahaan</td>
-      <td style="padding:2px 10px; vertical-align:top;">:</td>
-      <td style="padding:2px 0; vertical-align:top;">${esc(record.namaPerusahaan)}</td>
+      <td style="width:155px; padding:0; vertical-align:top; height:18px;">Nama Perusahaan</td>
+      <td style="padding:0 10px; vertical-align:top; height:18px;">:</td>
+      <td style="padding:0; vertical-align:top; height:18px;">${esc(record.namaPerusahaan)}</td>
     </tr>
     <tr>
-      <td style="padding:2px 0; vertical-align:top;">Jenis Objek K3</td>
-      <td style="padding:2px 10px; vertical-align:top;">:</td>
-      <td style="padding:2px 0; vertical-align:top;">${esc(record.jenisObjek)}</td>
+      <td style="padding:0; vertical-align:top; height:18px;">Jenis Objek K3</td>
+      <td style="padding:0 10px; vertical-align:top; height:18px;">:</td>
+      <td style="padding:0; vertical-align:top; height:18px;">${esc(record.jenisObjek)}</td>
     </tr>
     <tr>
-      <td style="padding:2px 0; vertical-align:top;">No. Serie</td>
-      <td style="padding:2px 10px; vertical-align:top;">:</td>
-      <td style="padding:2px 0; vertical-align:top;">${esc(record.noSerie)}</td>
+      <td style="padding:0; vertical-align:top; height:18px;">No. Serie</td>
+      <td style="padding:0 10px; vertical-align:top; height:18px;">:</td>
+      <td style="padding:0; vertical-align:top; height:18px;">${esc(record.noSerie)}</td>
     </tr>
   </table>
 
-  <!-- TABEL DOKUMENTASI (SATU TABEL UTUH) -->
-  <table border="1" cellspacing="0" cellpadding="0"
-         style="width:100%; border-collapse:collapse;
-                font-family:Arial,Helvetica,sans-serif;
-                border:1px solid #CBD5E1;">
+  <!-- TABEL DOKUMENTASI (MASING-MASING BLOK PUNYA TABEL SENDIRI) -->
+  <div style="width:100%;">
     ${allRows}
-  </table>
+  </div>
 
 </body>
 </html>`;
 
-      // ── Generate PDF menggunakan Puppeteer ──
-      let pdfUrl  = null;
-      let pdfPath = null;
+      // ── Generate PDF ──
+      let pdfUrl   = null;
+      let pdfPath  = null;
+      const pdfFilename  = `laporan_${safeSerie}_${sessionTs}.pdf`;
+      const pdfAbsPath   = path.join(recordDir, pdfFilename);
+      fs.mkdirSync(recordDir, { recursive: true });
+      
       try {
-        const pdfFilename = `laporan_${safeSerie}_${sessionTs}.pdf`;
-        const pdfAbsPath  = path.join(recordDir, pdfFilename);
-        fs.mkdirSync(recordDir, { recursive: true });
         await generatePDF(fullHtmlDoc, pdfAbsPath);
         const pdfRel = path.join(safeSerie, String(sessionTs), pdfFilename).replace(/\\/g, '/');
         pdfUrl  = `${baseUrl}/uploads/${pdfRel}`;
         pdfPath = pdfRel;
         console.log(`[PDF] ✓ ${pdfFilename}`);
-      } catch (pdfErr) {
-        console.warn(`[PDF] ✗ Generation failed for record ${rIdx + 1}:`, pdfErr.message);
+      } catch (genErr) {
+        console.warn(`[PDF] ✗ Generation failed for record ${rIdx + 1}:`, genErr.message);
+      }
+
+      // ── Generate Word (Docx) ──
+      let docxUrl  = null;
+      let docxPath = null;
+      const docxFilename = `laporan_${safeSerie}_${sessionTs}.docx`;
+      const docxAbsPath  = path.join(recordDir, docxFilename);
+      
+      try {
+        await generateDocx(fullHtmlDoc, docxAbsPath);
+        const docxRel = path.join(safeSerie, String(sessionTs), docxFilename).replace(/\\/g, '/');
+        docxUrl  = `${baseUrl}/uploads/${docxRel}`;
+        docxPath = docxRel;
+        console.log(`[DOCX] ✓ ${docxFilename}`);
+      } catch (genErr) {
+        console.warn(`[DOCX] ✗ Generation failed for record ${rIdx + 1}:`, genErr.message);
       }
 
       results.push({
@@ -450,6 +545,8 @@ app.post('/api/sync', async (req, res) => {
         fullHtmlDoc,
         pdfUrl,    // URL download PDF (null jika generasi gagal)
         pdfPath,
+        docxUrl,
+        docxPath,
         savedAt: new Date().toISOString()
       });
 
