@@ -1,20 +1,23 @@
+/// <reference lib="webworker" />
 // sw.js — Service Worker untuk Riksa Uji PJK3 PWA
 // Strategi: Cache-First untuk asset UI, bypass untuk API calls & uploads
 'use strict';
 
-const CACHE_NAME = 'riksauji-v20';
+const swSelf = /** @type {ServiceWorkerGlobalScope} */ (/** @type {unknown} */ (self));
+
+const CACHE_NAME = 'riksauji-v22';
 const STATIC_ASSETS = [
   '/',
   '/index.html',
   '/app.js',
-  '/app.js?v=20',
+  '/app.js?v=22',
   '/manifest.json',
   '/icons/icon-192.png',
   '/icons/icon-512.png'
 ];
 
 // ─── INSTALL: Pre-cache semua static assets ───
-self.addEventListener('install', (event) => {
+swSelf.addEventListener('install', (event) => {
   console.log('[SW] Install: Pre-caching static assets...');
   event.waitUntil(
     caches.open(CACHE_NAME)
@@ -23,7 +26,7 @@ self.addEventListener('install', (event) => {
       })
       .then(() => {
         console.log('[SW] All assets cached successfully.');
-        return self.skipWaiting(); // Aktifkan SW baru segera
+        return swSelf.skipWaiting(); // Aktifkan SW baru segera
       })
       .catch((err) => {
         console.error('[SW] Pre-cache failed:', err);
@@ -32,7 +35,7 @@ self.addEventListener('install', (event) => {
 });
 
 // ─── ACTIVATE: Hapus cache lama ───
-self.addEventListener('activate', (event) => {
+swSelf.addEventListener('activate', (event) => {
   console.log('[SW] Activate: Cleaning up old caches...');
   event.waitUntil(
     caches.keys()
@@ -48,13 +51,13 @@ self.addEventListener('activate', (event) => {
       })
       .then(() => {
         console.log('[SW] Old caches cleaned. Taking control of all clients.');
-        return self.clients.claim(); // Ambil alih klien tanpa reload
+        return swSelf.clients.claim(); // Ambil alih klien tanpa reload
       })
   );
 });
 
 // ─── FETCH: Cache-First strategy ───
-self.addEventListener('fetch', (event) => {
+swSelf.addEventListener('fetch', (event) => {
   const { request } = event;
   const url = new URL(request.url);
 
@@ -66,7 +69,7 @@ self.addEventListener('fetch', (event) => {
     request.method !== 'GET' ||
     url.pathname.startsWith('/api/') ||
     url.pathname.startsWith('/uploads/') ||
-    url.origin !== self.location.origin
+    url.origin !== swSelf.location.origin
   ) {
     // Biarkan network handle request ini langsung
     return;
@@ -119,7 +122,10 @@ self.addEventListener('fetch', (event) => {
             // Untuk navigasi (HTML request), kembalikan index.html dari cache
             if (isNavigation) {
               console.log('[SW] Offline fallback: serving cached index.html');
-              return caches.match('/index.html');
+              return caches.match('/index.html').then((r) => r || new Response('', {
+                status: 503,
+                statusText: 'Service Unavailable (Offline)'
+              }));
             }
             // Untuk aset lain, return response kosong daripada error
             return new Response('', {
@@ -132,9 +138,9 @@ self.addEventListener('fetch', (event) => {
 });
 
 // ─── MESSAGE: Handle pesan dari app ───
-self.addEventListener('message', (event) => {
+swSelf.addEventListener('message', (event) => {
   if (event.data && event.data.type === 'SKIP_WAITING') {
-    self.skipWaiting();
+    swSelf.skipWaiting();
   }
   if (event.data && event.data.type === 'GET_VERSION') {
     event.ports[0].postMessage({ version: CACHE_NAME });

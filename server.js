@@ -27,7 +27,7 @@ if (fs.existsSync(ENV_FILE)) {
 }
 
 const app        = express();
-const PORT       = process.env.PORT || 3000;
+const PORT       = Number(process.env.PORT) || 3000;
 const ACCESS_KEY = (process.env.ACCESS_KEY || '').trim();
 const UPLOADS    = path.join(__dirname, 'uploads');
 const PUBLIC_DIR = path.join(__dirname, 'public');
@@ -192,11 +192,64 @@ function esc(str) {
 }
 
 /**
- * Menyimpan string Base64 gambar ke disk sebagai file JPEG.
+ * Membaca dimensi asli (width & height) langsung dari header binary JPEG / PNG.
+ * Sangat cepat (<0.05ms) dan memastikan rasio gambar di Word/PDF tidak pernah gepeng.
+ * @param {Buffer} buf
+ * @returns {{width: number, height: number}}
+ */
+function readImageDimensions(buf) {
+  if (!buf || buf.length < 24) return { width: 0, height: 0 };
+
+  // PNG signature: 89 50 4E 47 0D 0A 1A 0A
+  if (buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4E && buf[3] === 0x47) {
+    return {
+      width:  buf.readUInt32BE(16),
+      height: buf.readUInt32BE(20)
+    };
+  }
+
+  // JPEG signature: FF D8
+  if (buf[0] === 0xFF && buf[1] === 0xD8) {
+    let offset = 2;
+    while (offset + 8 < buf.length) {
+      if (buf[offset] !== 0xFF) { offset++; continue; }
+      const marker = buf[offset + 1];
+      // Skip padding 0xFF
+      if (marker === 0xFF) { offset++; continue; }
+      // Standalone markers without length
+      if (marker === 0xD8 || marker === 0xD9 || (marker >= 0xD0 && marker <= 0xD7) || marker === 0x01) {
+        offset += 2;
+        continue;
+      }
+      const segLen = buf.readUInt16BE(offset + 2);
+      if (segLen < 2) break;
+      // SOF0..SOF3, SOF5..SOF7, SOF9..SOF11, SOF13..SOF15
+      if (
+        (marker >= 0xC0 && marker <= 0xC3) ||
+        (marker >= 0xC5 && marker <= 0xC7) ||
+        (marker >= 0xC9 && marker <= 0xCB) ||
+        (marker >= 0xCD && marker <= 0xCF)
+      ) {
+        return {
+          height: buf.readUInt16BE(offset + 5),
+          width:  buf.readUInt16BE(offset + 7)
+        };
+      }
+      offset += 2 + segLen;
+    }
+  }
+
+  return { width: 0, height: 0 };
+}
+
+/**
+ * Menyimpan string Base64 gambar ke disk sebagai file JPEG tajam (HD).
+ * Jika gambar dari PWA sudah berupa JPEG dengan ukuran <= 1600px, simpan langsung
+ * tanpa re-encode ulang agar tidak terjadi penurunan kualitas (hindari double-compression).
  * @param {string} base64Str  - Data URI Base64 ("data:image/...;base64,...")
  * @param {string} dirPath    - Absolute path direktori tujuan
  * @param {string} filename   - Nama file (misal: "foto_1.jpg")
- * @returns {string|null}     - Relative path (untuk URL) atau null jika gagal
+ * @returns {Promise<{filePath: string, width: number, height: number}|null>}
  */
 async function saveBase64Image(base64Str, dirPath, filename) {
   if (!base64Str || !base64Str.startsWith('data:image')) {
@@ -204,25 +257,44 @@ async function saveBase64Image(base64Str, dirPath, filename) {
   }
 
   try {
-    // Hapus prefix data URI dan decode ke Buffer
-    const base64Data = base64Str.replace(/^data:image\/\w+;base64,/, '');
+    const mimeMatch  = base64Str.match(/^data:(image\/[a-zA-Z0-9+.-]+);base64,/);
+    const mimeType   = mimeMatch ? mimeMatch[1].toLowerCase() : '';
+    const base64Data = base64Str.replace(/^data:image\/[a-zA-Z0-9+.-]+;base64,/, '');
     const buffer     = Buffer.from(base64Data, 'base64');
 
     // Buat direktori secara rekursif jika belum ada
     fs.mkdirSync(dirPath, { recursive: true });
     const filePath = path.join(dirPath, filename);
 
-    // Proses gambar menggunakan Jimp: kecilkan dimensi agar proporsional maksimal 800x800
-    // Tanpa background tambahan agar bentuk aslinya tetap terjaga (bebas letterbox)
+    const MAX_SERVER_DIM = 1600;
+    const dims = readImageDimensions(buffer);
+
+    // Jalur cepat tanpa penurunan kualitas: jika sudah JPEG & resolusi <= 1600px, tulis langsung!
+    if (
+      (mimeType === 'image/jpeg' || mimeType === 'image/jpg') &&
+      dims.width > 0 && dims.height > 0 &&
+      dims.width <= MAX_SERVER_DIM && dims.height <= MAX_SERVER_DIM
+    ) {
+      fs.writeFileSync(filePath, buffer);
+      return {
+        filePath,
+        width:  dims.width,
+        height: dims.height
+      };
+    }
+
+    // Fallback Jimp untuk format non-JPEG atau foto beresolusi > 1600px (kualitas tinggi 92)
     const image = await Jimp.read(buffer);
-    image.scaleToFit({ w: 800, h: 800 });
-    const processedBuffer = await image.getBuffer('image/jpeg');
+    if (image.bitmap.width > MAX_SERVER_DIM || image.bitmap.height > MAX_SERVER_DIM) {
+      image.scaleToFit({ w: MAX_SERVER_DIM, h: MAX_SERVER_DIM });
+    }
+    const processedBuffer = await image.getBuffer('image/jpeg', { quality: 92 });
 
     fs.writeFileSync(filePath, processedBuffer);
 
     return {
       filePath,
-      width: image.bitmap.width,
+      width:  image.bitmap.width,
       height: image.bitmap.height
     };
   } catch (err) {
@@ -293,19 +365,25 @@ function generateBase6Grid(blok, imagePaths, baseUrl) {
     if (imgData && imgData.relPath) {
       const absPath = path.join(__dirname, 'uploads', imgData.relPath);
       if (fs.existsSync(absPath)) {
-        const ext = path.extname(absPath).substring(1) || 'jpeg';
-        const b64 = fs.readFileSync(absPath).toString('base64');
-        imgSrc = `data:image/${ext};base64,${b64}`;
+        const ext     = path.extname(absPath).substring(1) || 'jpeg';
+        const fileBuf = fs.readFileSync(absPath);
+        const b64     = fileBuf.toString('base64');
+        imgSrc  = `data:image/${ext === 'jpg' ? 'jpeg' : ext};base64,${b64}`;
         actualW = imgData.width || 0;
         actualH = imgData.height || 0;
+        if (!actualW || !actualH) {
+          const detected = readImageDimensions(fileBuf);
+          actualW = detected.width;
+          actualH = detected.height;
+        }
       }
     }
     const ket = esc(slot.keterangan || '\u2014');
 
-    let maxW = 280;
-    let maxH = 280;
-    if (blok.layout === '1col') { maxW = 500; maxH = 400; }
-    if (blok.layout === '3col') { maxW = 180; maxH = 180; }
+    let maxW = 285;
+    let maxH = 340;
+    if (blok.layout === '1col') { maxW = 520; maxH = 440; }
+    if (blok.layout === '3col') { maxW = 185; maxH = 240; }
 
     let finalW = maxW;
     let finalH = maxH;
@@ -366,7 +444,7 @@ async function getBrowser() {
     try { await _browser.close(); } catch (e) {}
   }
   const launchOpts = {
-    headless: 'new',
+    headless: true,
     args: [
       '--no-sandbox',
       '--disable-setuid-sandbox',
@@ -409,8 +487,8 @@ async function generatePDF(htmlContent, outputPath) {
   const page    = await browser.newPage();
 
   try {
-    // Set viewport A4
-    await page.setViewport({ width: 794, height: 1123 });
+    // Set viewport A4 dengan ketajaman 2x (Retina)
+    await page.setViewport({ width: 794, height: 1123, deviceScaleFactor: 2 });
 
     // Load HTML — waitUntil networkidle0 agar semua gambar local ter-render
     await page.setContent(htmlContent, { waitUntil: 'networkidle2', timeout: 30000 });
@@ -994,9 +1072,7 @@ app.post('/api/server-records/:safeSerie/:sessionTs/regenerate', requireAccessKe
       try { meta = JSON.parse(fs.readFileSync(metaPath, 'utf8')); } catch (_) {}
     }
 
-    if (fs.existsSync(sourcePath)) {
-      fullHtmlDoc = fs.readFileSync(sourcePath, 'utf8');
-    } else if (meta && Array.isArray(meta.bloks)) {
+    if (meta && Array.isArray(meta.bloks)) {
       const rows = meta.bloks.map((b) => {
         const imagePaths = (b.slots || []).map(s =>
           s.imageRelPath ? { relPath: s.imageRelPath, width: s.width || 0, height: s.height || 0 } : null
@@ -1005,6 +1081,8 @@ app.post('/api/server-records/:safeSerie/:sessionTs/regenerate', requireAccessKe
       }).join('\n');
       fullHtmlDoc = buildFullHtmlDoc(meta, rows);
       fs.writeFileSync(sourcePath, fullHtmlDoc, 'utf8');
+    } else if (fs.existsSync(sourcePath)) {
+      fullHtmlDoc = fs.readFileSync(sourcePath, 'utf8');
     } else {
       const summary = readServerSessionSummary(safeSerie, sessionTs, baseUrl) || {
         namaPerusahaan: `Laporan (SN: ${safeSerie})`,

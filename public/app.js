@@ -12,8 +12,8 @@ const API_ENDPOINT          = '/api/sync';
 const AUTH_ENDPOINT         = '/api/auth';
 const ACCESS_KEY_STORAGE    = 'riksauji_access_key';
 const AUTH_VERIFIED_STORAGE = 'riksauji_auth_ok';
-const MAX_IMAGE_DIM         = 800;   // px — dimensi max setelah resize
-const JPEG_QUALITY          = 0.7;   // 0–1, kualitas kompresi JPEG
+const MAX_IMAGE_DIM         = 1600;  // px — dimensi HD agar teks nameplate/alat ukur tajam di PDF & Word
+const JPEG_QUALITY          = 0.88;  // 0–1, kualitas JPEG tinggi namun tetap hemat memori & kuota sync
 
 const SLOT_LABELS = {
   '1col': ['Foto'],
@@ -397,11 +397,13 @@ function compressImage(file) {
           height = Math.round(height * ratio);
         }
 
-        // Gambar ulang ke canvas dengan ukuran yang sudah di-resize
+        // Gambar ulang ke canvas dengan ukuran yang sudah di-resize (interpolasi tajam)
         const canvas = document.createElement('canvas');
         canvas.width  = width;
         canvas.height = height;
         const ctx = canvas.getContext('2d');
+        ctx.imageSmoothingEnabled = true;
+        ctx.imageSmoothingQuality = 'high';
         ctx.drawImage(img, 0, 0, width, height);
 
         // Export ke Base64 JPEG
@@ -745,7 +747,7 @@ async function startCameraStream() {
   shutterEl.disabled = true;
 
   const attempts = [
-    { audio: false, video: { facingMode: { ideal: _camFacingMode }, width: { ideal: 1600 }, height: { ideal: 1200 } } },
+    { audio: false, video: { facingMode: { ideal: _camFacingMode }, width: { ideal: 1920 }, height: { ideal: 1440 } } },
     { audio: false, video: { facingMode: _camFacingMode } },
     { audio: false, video: true }
   ];
@@ -823,6 +825,8 @@ function captureFromCamera() {
   canvas.width  = width;
   canvas.height = height;
   const ctx = canvas.getContext('2d');
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = 'high';
   ctx.drawImage(videoEl, 0, 0, width, height);
 
   const base64       = canvas.toDataURL('image/jpeg', JPEG_QUALITY);
@@ -1267,8 +1271,14 @@ function buildAuthHeaders(extra = {}) {
 function updateDrawerTabUI() {
   const tabLocal  = document.getElementById('tab-local');
   const tabServer = document.getElementById('tab-server');
-  if (tabLocal)  tabLocal.classList.toggle('active', activeDrawerTab === 'local');
-  if (tabServer) tabServer.classList.toggle('active', activeDrawerTab === 'server');
+  if (tabLocal) {
+    tabLocal.classList.toggle('active', activeDrawerTab === 'local');
+    tabLocal.setAttribute('aria-selected', activeDrawerTab === 'local' ? 'true' : 'false');
+  }
+  if (tabServer) {
+    tabServer.classList.toggle('active', activeDrawerTab === 'server');
+    tabServer.setAttribute('aria-selected', activeDrawerTab === 'server' ? 'true' : 'false');
+  }
 }
 
 function setTabCount(id, count) {
@@ -1357,7 +1367,8 @@ function renderRecordsPanel(records) {
       </svg>
       Sync (${pendingCount})
     `;
-    syncBtn.style = `
+    syncBtn.type = 'button';
+    syncBtn.style.cssText = `
       display: inline-flex; align-items: center; gap: 5px;
       background: var(--primary); color: #fff; border: none; border-radius: 6px;
       padding: 6px 12px; font-size: 11px; font-weight: 700; cursor: pointer;
@@ -1509,10 +1520,11 @@ async function loadServerRecords(shouldRender = true) {
     clearDrawerHeaderBtn();
     const headerDiv = document.querySelector('.drawer-header');
     const refreshBtn = document.createElement('button');
+    refreshBtn.type = 'button';
     refreshBtn.id = 'drawer-sync-btn';
     refreshBtn.onclick = () => loadServerRecords(true);
     refreshBtn.innerHTML = '↻ Segarkan';
-    refreshBtn.style = `
+    refreshBtn.style.cssText = `
       display: inline-flex; align-items: center; gap: 5px;
       background: var(--primary-light); color: var(--primary);
       border: 1px solid var(--primary-border); border-radius: 6px;

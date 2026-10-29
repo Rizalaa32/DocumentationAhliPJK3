@@ -2,7 +2,7 @@
 <html lang="id">
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
@@ -57,6 +57,7 @@
     html {
       font-size: 16px;
       -webkit-text-size-adjust: 100%;
+      text-size-adjust: 100%;
       -webkit-tap-highlight-color: transparent;
       scroll-behavior: smooth;
     }
@@ -299,8 +300,8 @@
       color: var(--text);
       background: var(--card);
       transition: border-color 0.2s, box-shadow 0.2s;
-      appearance: none;
       -webkit-appearance: none;
+      appearance: none;
     }
 
     input[type="text"]:focus,
@@ -602,7 +603,7 @@
 
     .photo-actions { display: flex; flex-wrap: wrap; gap: 6px; }
 
-    label.btn-cam { margin-bottom: 0; color: #fff; text-decoration: none; user-select: none; -webkit-user-select: none; min-width: 112px; }
+    label.btn-cam { margin-bottom: 0; color: #fff; text-decoration: none; -webkit-user-select: none; user-select: none; min-width: 112px; }
 
     .btn-galeri {
       flex: 1;
@@ -624,8 +625,8 @@
       transition: var(--ease);
       min-height: 46px;
       text-decoration: none;
-      user-select: none;
       -webkit-user-select: none;
+      user-select: none;
     }
     .btn-galeri:hover { background: var(--primary-light); }
     .btn-galeri:active { transform: scale(0.97); }
@@ -696,8 +697,8 @@
       left: 0;
       right: 0;
       background: rgba(255,255,255,0.96);
-      backdrop-filter: blur(14px);
       -webkit-backdrop-filter: blur(14px);
+      backdrop-filter: blur(14px);
       border-top: 1px solid var(--border-light);
       padding: 12px 16px;
       padding-bottom: calc(12px + env(safe-area-inset-bottom, 0px));
@@ -1034,8 +1035,8 @@
       position: fixed;
       inset: 0;
       background: rgba(15, 23, 42, 0.82);
-      backdrop-filter: blur(8px);
       -webkit-backdrop-filter: blur(8px);
+      backdrop-filter: blur(8px);
       z-index: 2000;
       display: flex;
       align-items: center;
@@ -1216,7 +1217,7 @@
         <p>Dokumentasi Lapangan Offline</p>
       </div>
     </div>
-    <button class="header-btn" id="btn-open-records" onclick="openDrawer()">
+    <button type="button" class="header-btn" id="btn-open-records" onclick="openDrawer()">
       <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
       Data
       <span class="badge hidden" id="pending-badge">0</span>
@@ -1231,7 +1232,7 @@
   <!-- PWA Update Banner -->
   <div class="update-banner hidden" id="update-banner">
     <span>🆕 Versi baru tersedia!</span>
-    <button onclick="applyUpdate()">Perbarui</button>
+    <button type="button" onclick="applyUpdate()">Perbarui</button>
   </div>
 
   <!-- ═══ STATUS BAR ═══ -->
@@ -1306,7 +1307,7 @@
         <div id="block-list" aria-label="Daftar blok dokumentasi"></div>
 
         <!-- Add Block Button -->
-        <button class="btn btn-outline mb-14" id="btn-add-block" onclick="addBlock()" aria-label="Tambah blok dokumentasi baru">
+        <button type="button" class="btn btn-outline mb-14" id="btn-add-block" onclick="addBlock()" aria-label="Tambah blok dokumentasi baru">
           <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
           Tambah Blok Dokumentasi
         </button>
@@ -1335,15 +1336,15 @@
     <div class="drawer-handle"></div>
     <div class="drawer-header">
       <span class="drawer-title">📁 Data &amp; Arsip Laporan</span>
-      <button class="drawer-close" onclick="closeDrawer()" aria-label="Tutup panel">
+      <button type="button" class="drawer-close" onclick="closeDrawer()" aria-label="Tutup panel">
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
       </button>
     </div>
     <div class="drawer-tabs" role="tablist" aria-label="Sumber data laporan">
-      <button type="button" class="drawer-tab active" id="tab-local" onclick="switchDrawerTab('local')">
+      <button type="button" role="tab" aria-selected="true" class="drawer-tab active" id="tab-local" onclick="switchDrawerTab('local')">
         📱 Perangkat Ini <span class="drawer-tab-count" id="count-local">0</span>
       </button>
-      <button type="button" class="drawer-tab" id="tab-server" onclick="switchDrawerTab('server')">
+      <button type="button" role="tab" aria-selected="false" class="drawer-tab" id="tab-server" onclick="switchDrawerTab('server')">
         ☁️ Arsip Server <span class="drawer-tab-count" id="count-server">0</span>
       </button>
     </div>
@@ -1384,12 +1385,13 @@
       <button type="button" class="camera-close-btn" onclick="closeCameraModal()" aria-label="Tutup kamera">✕</button>
     </div>
     <div class="camera-stage">
-      <video id="camera-video" autoplay playsinline webkit-playsinline muted></video>
+      <video id="camera-video" autoplay playsinline muted></video>
       <div class="camera-msg hidden" id="camera-msg">
         <div id="camera-msg-text">Meminta izin kamera…</div>
         <div style="display:flex; flex-wrap:wrap; gap:8px; justify-content:center; margin-top:4px;">
           <button type="button" class="btn btn-primary btn-sm" style="width:auto;" onclick="retryCameraStream()">Coba Lagi</button>
-          <label class="btn btn-secondary btn-sm" id="camera-fallback-label" style="width:auto; margin-bottom:0; cursor:pointer;">Kamera Sistem HP</label>
+          <label for="cam-global-fallback" class="btn btn-secondary btn-sm" id="camera-fallback-label" style="width:auto; margin-bottom:0; cursor:pointer;">Kamera Sistem HP</label>
+          <input type="file" class="sr-file-input" id="cam-global-fallback" accept="image/*" capture="environment" aria-label="Kamera sistem" onchange="if(_camTargetBId!==null)handleFile(_camTargetBId,_camTargetSlot,this)">
         </div>
       </div>
     </div>
@@ -1400,6 +1402,6 @@
     </div>
   </div>
 
-  <script src="/app.js?v=20"></script>
+  <script src="/app.js?v=22"></script>
 </body>
 </html>
