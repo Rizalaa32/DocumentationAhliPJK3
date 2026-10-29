@@ -9,7 +9,7 @@
   <meta name="apple-mobile-web-app-title" content="Riksa Uji PJK3">
   <meta name="description" content="Sistem Dokumentasi Riksa Uji untuk Ahli PJK3. Offline-First PWA untuk engineer lapangan.">
   <title>Riksa Uji PJK3 — Dokumentasi Lapangan</title>
-  <link rel="manifest" href="/manifest.json">
+  <link rel="manifest" href="/manifest.json" crossorigin="use-credentials">
   <link rel="apple-touch-icon" href="/icons/icon-192.png">
   <meta name="theme-color" content="#1E3A5F">
   <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -921,6 +921,76 @@
       white-space: nowrap;
       flex-shrink: 0;
     }
+    /* ═══════════════════════════════════════
+       ACCESS GATE OVERLAY (Secret Link / Key)
+    ═══════════════════════════════════════ */
+    .auth-overlay {
+      position: fixed;
+      inset: 0;
+      background: rgba(15, 23, 42, 0.82);
+      backdrop-filter: blur(8px);
+      -webkit-backdrop-filter: blur(8px);
+      z-index: 2000;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 20px;
+    }
+    .auth-card {
+      background: var(--card);
+      width: 100%;
+      max-width: 400px;
+      border-radius: var(--r-lg);
+      padding: 24px 20px;
+      box-shadow: var(--sh-lg);
+      border: 1px solid var(--border-light);
+      text-align: center;
+    }
+    .auth-icon {
+      width: 52px;
+      height: 52px;
+      border-radius: 14px;
+      background: var(--primary-light);
+      color: var(--primary);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      margin: 0 auto 14px;
+    }
+    .auth-card h2 {
+      font-size: 17px;
+      font-weight: 800;
+      color: var(--navy);
+      margin-bottom: 6px;
+    }
+    .auth-card p {
+      font-size: 13px;
+      color: var(--text-sec);
+      line-height: 1.55;
+      margin-bottom: 16px;
+    }
+    .auth-input {
+      width: 100%;
+      padding: 13px 15px;
+      border: 2px solid var(--border);
+      border-radius: var(--r);
+      font-size: 15px;
+      font-family: inherit;
+      color: var(--text);
+      margin-bottom: 12px;
+      text-align: center;
+    }
+    .auth-input:focus {
+      outline: none;
+      border-color: var(--primary);
+      box-shadow: 0 0 0 3px rgba(37,99,235,.12);
+    }
+    .auth-error {
+      font-size: 12.5px;
+      font-weight: 600;
+      color: var(--danger);
+      margin-bottom: 10px;
+    }
   </style>
 </head>
 
@@ -1066,6 +1136,28 @@
     </div>
   </div>
 
-  <script src="/app.js?v=14"></script>
+  <!-- ═══ ACCESS KEY OVERLAY ═══ -->
+  <div class="auth-overlay hidden" id="auth-overlay" role="dialog" aria-modal="true" aria-label="Verifikasi Akses Tim">
+    <div class="auth-card">
+      <div class="auth-icon">
+        <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <rect x="3" y="11" width="18" height="11" rx="2" ry="2"/>
+          <path d="M7 11V7a5 5 0 0 1 10 0v4"/>
+        </svg>
+      </div>
+      <h2>Akses Terbatas Tim PJK3</h2>
+      <p>Buka aplikasi melalui <strong>tautan khusus</strong> dari Admin, atau tempel tautan / Kode Akses di bawah ini (cukup sekali di perangkat ini).</p>
+      <div class="auth-error hidden" id="auth-error"></div>
+      <input type="password" id="auth-key-input" class="auth-input"
+             placeholder="Masukkan Kode Akses atau Tautan…"
+             autocomplete="off"
+             onkeydown="if(event.key==='Enter')submitAccessKey()">
+      <button type="button" class="btn btn-primary btn-sm" id="btn-auth-submit" onclick="submitAccessKey()">
+        Buka Aplikasi
+      </button>
+    </div>
+  </div>
+
+  <script src="/app.js?v=16"></script>
 </body>
 </html>

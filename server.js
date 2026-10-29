@@ -4,16 +4,117 @@
 
 const express    = require('express');
 const cors       = require('cors');
+const crypto     = require('crypto');
 const path       = require('path');
 const fs         = require('fs');
 const puppeteer  = require('puppeteer');
 const htmlDocx   = require('html-docx-js');
 const { Jimp }   = require('jimp');
 
+// Muat konfigurasi dari file .env jika tersedia (tanpa dependency tambahan)
+const ENV_FILE = path.join(__dirname, '.env');
+if (fs.existsSync(ENV_FILE)) {
+  fs.readFileSync(ENV_FILE, 'utf8').split(/\r?\n/).forEach((line) => {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) return;
+    const eqIdx = trimmed.indexOf('=');
+    if (eqIdx > 0) {
+      const k = trimmed.slice(0, eqIdx).trim();
+      const v = trimmed.slice(eqIdx + 1).trim().replace(/^['"]|['"]$/g, '');
+      if (!(k in process.env)) process.env[k] = v;
+    }
+  });
+}
+
 const app        = express();
 const PORT       = process.env.PORT || 3000;
+const ACCESS_KEY = (process.env.ACCESS_KEY || '').trim();
 const UPLOADS    = path.join(__dirname, 'uploads');
 const PUBLIC_DIR = path.join(__dirname, 'public');
+
+// Percayai reverse proxy (Nginx / Cloudflare) agar IP & protokol HTTPS terbaca akurat
+app.set('trust proxy', 1);
+
+// ════════════════════════════════════════════════════════════
+// ACCESS CONTROL & PROXY HELPERS
+// ════════════════════════════════════════════════════════════
+
+function safeCompare(a, b) {
+  const bufA = Buffer.from(String(a || ''));
+  const bufB = Buffer.from(String(b || ''));
+  if (bufA.length !== bufB.length || bufA.length === 0) return false;
+  return crypto.timingSafeEqual(bufA, bufB);
+}
+
+function parseCookies(req) {
+  const header = req.headers.cookie || '';
+  const out = {};
+  header.split(';').forEach((part) => {
+    const idx = part.indexOf('=');
+    if (idx > 0) {
+      const k = part.slice(0, idx).trim();
+      const v = part.slice(idx + 1).trim();
+      try { out[k] = decodeURIComponent(v); } catch (_) { out[k] = v; }
+    }
+  });
+  return out;
+}
+
+function getClientProtocol(req) {
+  if (req.headers['cf-visitor']) {
+    try {
+      const cf = JSON.parse(req.headers['cf-visitor']);
+      if (cf && cf.scheme) return cf.scheme;
+    } catch (_) {}
+  }
+  const xfProto = req.headers['x-forwarded-proto'];
+  if (xfProto) return String(xfProto).split(',')[0].trim();
+  return req.protocol || 'http';
+}
+
+function getBaseUrl(req) {
+  return `${getClientProtocol(req)}://${req.get('host')}`;
+}
+
+function isAuthorized(req) {
+  if (!ACCESS_KEY) return true;
+  const headerKey = req.headers['x-access-key'];
+  const queryKey  = req.query ? req.query.key : undefined;
+  const cookies   = parseCookies(req);
+  const cookieKey = cookies.riksauji_key;
+
+  return (
+    safeCompare(headerKey, ACCESS_KEY) ||
+    safeCompare(queryKey, ACCESS_KEY) ||
+    safeCompare(cookieKey, ACCESS_KEY)
+  );
+}
+
+function setAuthCookie(req, res) {
+  if (!ACCESS_KEY) return;
+  const isHttps = getClientProtocol(req) === 'https';
+  const parts = [
+    `riksauji_key=${encodeURIComponent(ACCESS_KEY)}`,
+    'Path=/',
+    'Max-Age=31536000',
+    'HttpOnly',
+    'SameSite=Lax'
+  ];
+  if (isHttps) parts.push('Secure');
+  res.setHeader('Set-Cookie', parts.join('; '));
+}
+
+function requireAccessKey(req, res, next) {
+  if (!isAuthorized(req)) {
+    return res.status(401).json({
+      success: false,
+      code:    'UNAUTHORIZED',
+      message: 'Akses ditolak. Gunakan tautan khusus atau masukkan Kode Akses yang benar.'
+    });
+  }
+  setAuthCookie(req, res);
+  next();
+}
 
 // ════════════════════════════════════════════════════════════
 // MIDDLEWARE
@@ -22,18 +123,38 @@ const PUBLIC_DIR = path.join(__dirname, 'public');
 app.use(cors({
   origin:         process.env.ALLOWED_ORIGIN || '*',
   methods:        ['GET', 'POST'],
-  allowedHeaders: ['Content-Type', 'Accept']
+  allowedHeaders: ['Content-Type', 'Accept', 'X-Access-Key']
 }));
 
 // Limit payload 50MB untuk menampung banyak gambar Base64
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
+// Pastikan sw.js tidak di-cache agresif oleh browser / CDN Cloudflare
+app.get('/sw.js', (req, res, next) => {
+  res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+  next();
+});
+
+// Set cookie akses otomatis saat pertama kali dibuka via secret link (?key=...)
+app.use((req, res, next) => {
+  if (ACCESS_KEY && req.method === 'GET' && req.query && req.query.key && isAuthorized(req)) {
+    setAuthCookie(req, res);
+  }
+  next();
+});
+
 // Serve PWA static files dari /public
 app.use(express.static(PUBLIC_DIR));
 
-// Expose folder gambar yang tersimpan
-app.use('/uploads', express.static(UPLOADS));
+// Expose folder gambar & dokumen yang tersimpan (dilindungi ACCESS_KEY jika aktif)
+app.use('/uploads', (req, res, next) => {
+  if (!isAuthorized(req)) {
+    return res.status(401).send('401 Unauthorized — Buka aplikasi melalui tautan resmi terlebih dahulu.');
+  }
+  setAuthCookie(req, res);
+  next();
+}, express.static(UPLOADS));
 
 // ════════════════════════════════════════════════════════════
 // UTILITY FUNCTIONS
@@ -242,7 +363,7 @@ async function getBrowser() {
   if (_browser) {
     try { await _browser.close(); } catch (e) {}
   }
-  _browser = await puppeteer.launch({
+  const launchOpts = {
     headless: 'new',
     args: [
       '--no-sandbox',
@@ -250,7 +371,11 @@ async function getBrowser() {
       '--disable-dev-shm-usage',
       '--disable-gpu'
     ]
-  });
+  };
+  if (process.env.PUPPETEER_EXECUTABLE_PATH) {
+    launchOpts.executablePath = process.env.PUPPETEER_EXECUTABLE_PATH;
+  }
+  _browser = await puppeteer.launch(launchOpts);
   console.log('[PDF] Puppeteer browser launched.');
   return _browser;
 }
@@ -320,11 +445,42 @@ async function generateDocx(htmlContent, outputPath) {
  */
 app.get('/api/health', (req, res) => {
   res.json({
-    status:    'ok',
-    app:       'Riksa Uji PJK3 API',
-    version:   '1.0.0',
-    timestamp: new Date().toISOString(),
-    uptime:    process.uptime()
+    status:       'ok',
+    app:          'Riksa Uji PJK3 API',
+    version:      '1.0.0',
+    authRequired: Boolean(ACCESS_KEY),
+    timestamp:    new Date().toISOString(),
+    uptime:       process.uptime()
+  });
+});
+
+/**
+ * GET / POST /api/auth
+ * Verifikasi tautan rahasia / Kode Akses tim dan pasang HttpOnly cookie untuk akses /uploads
+ */
+app.all('/api/auth', (req, res) => {
+  if (!ACCESS_KEY) {
+    return res.json({
+      success:       true,
+      authRequired:  false,
+      authenticated: true
+    });
+  }
+
+  if (isAuthorized(req)) {
+    setAuthCookie(req, res);
+    return res.json({
+      success:       true,
+      authRequired:  true,
+      authenticated: true
+    });
+  }
+
+  return res.status(401).json({
+    success:       false,
+    authRequired:  true,
+    authenticated: false,
+    message:       'Kode akses diperlukan atau tidak valid.'
   });
 });
 
@@ -365,7 +521,7 @@ app.get('/api/health', (req, res) => {
  *     errors:    [...] | undefined
  *   }
  */
-app.post('/api/sync', async (req, res) => {
+app.post('/api/sync', requireAccessKey, async (req, res) => {
   const { records } = req.body;
 
   // Validasi payload
@@ -378,7 +534,7 @@ app.post('/api/sync', async (req, res) => {
 
   const results   = [];
   const errors    = [];
-  const baseUrl   = `${req.protocol}://${req.get('host')}`;
+  const baseUrl   = getBaseUrl(req);
   const sessionTs = Date.now(); // Timestamp sesi sinkronisasi ini
 
   for (let rIdx = 0; rIdx < records.length; rIdx++) {
@@ -578,7 +734,7 @@ app.post('/api/sync', async (req, res) => {
  * Daftar semua sesi sinkronisasi untuk No. Seri tertentu.
  * Berguna untuk debugging dan review.
  */
-app.get('/api/records/:noSerie', (req, res) => {
+app.get('/api/records/:noSerie', requireAccessKey, (req, res) => {
   const safeSerie  = sanitizePath(req.params.noSerie);
   const recordPath = path.join(UPLOADS, safeSerie);
 
@@ -620,7 +776,7 @@ app.get('/api/records/:noSerie', (req, res) => {
  * (Opsional) Ambil HTML grid untuk satu blok spesifik.
  * Berguna jika ingin regenerate HTML tanpa re-upload.
  */
-app.get('/api/html/:noSerie/:sessionTs/:blokNum', (req, res) => {
+app.get('/api/html/:noSerie/:sessionTs/:blokNum', requireAccessKey, (req, res) => {
   const { noSerie, sessionTs, blokNum } = req.params;
   const safeSerie = sanitizePath(noSerie);
   const blokDir   = path.join(UPLOADS, safeSerie, sessionTs, `blok_${blokNum}`);
@@ -631,7 +787,7 @@ app.get('/api/html/:noSerie/:sessionTs/:blokNum', (req, res) => {
 
   const files  = fs.readdirSync(blokDir);
   const imgs   = files.filter(f => /\.(jpg|jpeg|png)$/i.test(f));
-  const baseUrl = `${req.protocol}://${req.get('host')}`;
+  const baseUrl = getBaseUrl(req);
 
   const relativePaths = imgs.map(f =>
     path.join(safeSerie, sessionTs, `blok_${blokNum}`, f).replace(/\\/g, '/')
@@ -664,17 +820,32 @@ app.get('*', (req, res) => {
 fs.mkdirSync(UPLOADS, { recursive: true });
 console.log(`[Server] Uploads dir: ${UPLOADS}`);
 
-app.listen(PORT, () => {
+const HOST = process.env.HOST || '0.0.0.0';
+const server = app.listen(PORT, HOST, () => {
+  const authLabel = ACCESS_KEY ? 'AKTIF (Secret Link/Key)' : 'TERBUKA (Dev Mode)';
   console.log(`
 ╔══════════════════════════════════════════════════════╗
 ║     Riksa Uji PJK3 — Backend API Server             ║
 ╠══════════════════════════════════════════════════════╣
 ║  🚀  Buka di browser : http://localhost:${PORT}          ║
 ║  📡  API Sync        : POST /api/sync                ║
+║  🔒  Proteksi Akses  : ${authLabel.padEnd(28)}  ║
 ║  📁  Folder uploads  : ./uploads/                    ║
 ║  🌐  Mode            : ${(process.env.NODE_ENV || 'development').padEnd(12)}                  ║
 ╚══════════════════════════════════════════════════════╝
   `);
 });
+
+async function gracefulShutdown(signal) {
+  console.log(`\n[Server] Menerima ${signal}, menutup Puppeteer & HTTP server...`);
+  if (_browser) {
+    try { await _browser.close(); } catch (_) {}
+  }
+  server.close(() => process.exit(0));
+  setTimeout(() => process.exit(0), 5000).unref();
+}
+
+process.on('SIGINT',  () => gracefulShutdown('SIGINT'));
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 
 module.exports = app;

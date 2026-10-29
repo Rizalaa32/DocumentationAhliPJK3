@@ -1,16 +1,19 @@
 // app.js — Logika PWA Riksa Uji PJK3
-// Mencakup: IndexedDB, Kompresi Canvas, Dynamic Block Builder, Sync
+// Mencakup: IndexedDB, Kompresi Canvas, Dynamic Block Builder, Access Key Gate, Sync
 'use strict';
 
 // ════════════════════════════════════════════════════════════
 // CONFIGURATION
 // ════════════════════════════════════════════════════════════
-const DB_NAME        = 'riksauji_db';
-const DB_VERSION     = 1;
-const STORE_NAME     = 'laporan';
-const API_ENDPOINT   = '/api/sync';
-const MAX_IMAGE_DIM  = 800;   // px — dimensi max setelah resize
-const JPEG_QUALITY   = 0.7;   // 0–1, kualitas kompresi JPEG
+const DB_NAME               = 'riksauji_db';
+const DB_VERSION            = 1;
+const STORE_NAME            = 'laporan';
+const API_ENDPOINT          = '/api/sync';
+const AUTH_ENDPOINT         = '/api/auth';
+const ACCESS_KEY_STORAGE    = 'riksauji_access_key';
+const AUTH_VERIFIED_STORAGE = 'riksauji_auth_ok';
+const MAX_IMAGE_DIM         = 800;   // px — dimensi max setelah resize
+const JPEG_QUALITY          = 0.7;   // 0–1, kualitas kompresi JPEG
 
 const SLOT_LABELS = {
   '1col': ['Foto'],
@@ -23,11 +26,186 @@ const SLOT_COUNTS = { '1col': 1, '2col': 2, '3col': 3 };
 // ════════════════════════════════════════════════════════════
 // STATE
 // ════════════════════════════════════════════════════════════
-let db            = null;   // IndexedDB instance
-let blockCounter  = 0;      // Penomoran blok dokumentasi
-let isSyncing     = false;  // Guard flag untuk sync
-let swRegistration = null;  // Service Worker registration
-let editingId     = null;   // Menyimpan ID record yang sedang diedit
+let db             = null;   // IndexedDB instance
+let blockCounter   = 0;      // Penomoran blok dokumentasi
+let isSyncing      = false;  // Guard flag untuk sync
+let swRegistration = null;   // Service Worker registration
+let editingId      = null;   // Menyimpan ID record yang sedang diedit
+
+// ════════════════════════════════════════════════════════════
+// ACCESS CONTROL (Secret Link ?key=... & Kode Akses Lokal)
+// ════════════════════════════════════════════════════════════
+
+/**
+ * Mengekstrak kode akses baik dari input kode langsung maupun URL utuh (?key=...).
+ * Memudahkan anggota tim jika menyalin seluruh link WhatsApp ke kolom input.
+ * @param {string} rawInput
+ * @returns {string}
+ */
+function extractAccessKey(rawInput) {
+  const trimmed = String(rawInput || '').trim();
+  if (!trimmed) return '';
+  if (trimmed.includes('?key=') || trimmed.includes('&key=') || /^https?:\/\//i.test(trimmed)) {
+    try {
+      const parsed = new URL(trimmed, window.location.origin);
+      const fromParam = parsed.searchParams.get('key');
+      if (fromParam) return fromParam.trim();
+    } catch (_) {}
+  }
+  return trimmed;
+}
+
+function getStoredAccessKey() {
+  try {
+    return localStorage.getItem(ACCESS_KEY_STORAGE) || '';
+  } catch (_) {
+    return '';
+  }
+}
+
+function showAuthOverlay(errorMsg = '') {
+  const overlay = document.getElementById('auth-overlay');
+  const errEl   = document.getElementById('auth-error');
+  if (!overlay) return;
+
+  if (errEl) {
+    if (errorMsg) {
+      errEl.textContent = errorMsg;
+      errEl.classList.remove('hidden');
+    } else {
+      errEl.textContent = '';
+      errEl.classList.add('hidden');
+    }
+  }
+  overlay.classList.remove('hidden');
+}
+
+function hideAuthOverlay() {
+  const overlay = document.getElementById('auth-overlay');
+  const errEl   = document.getElementById('auth-error');
+  if (overlay) overlay.classList.add('hidden');
+  if (errEl) {
+    errEl.textContent = '';
+    errEl.classList.add('hidden');
+  }
+}
+
+/**
+ * Memeriksa status akses saat aplikasi dibuka:
+ * 1. Jika dibuka melalui tautan khusus (?key=...), simpan kunci ke localStorage & bersihkan URL.
+ * 2. Jika sedang offline, jangan pernah memblokir pemakaian form lapangan.
+ * 3. Jika sedang online, verifikasi ke /api/auth sekaligus memperbarui cookie unduhan /uploads.
+ */
+async function initAccessControl() {
+  let cameFromLink = false;
+
+  try {
+    const params = new URLSearchParams(window.location.search);
+    const urlKey = params.get('key');
+    if (urlKey && urlKey.trim()) {
+      localStorage.setItem(ACCESS_KEY_STORAGE, urlKey.trim());
+      cameFromLink = true;
+      // Bersihkan ?key=... dari address bar agar aman dan rapi saat di-install sebagai PWA
+      params.delete('key');
+      const restQuery = params.toString();
+      const cleanUrl  = window.location.pathname + (restQuery ? `?${restQuery}` : '') + window.location.hash;
+      window.history.replaceState({}, document.title, cleanUrl);
+    }
+  } catch (e) {
+    console.warn('[Auth] URL param check failed:', e);
+  }
+
+  // Saat offline di lapangan, biarkan aplikasi langsung berjalan penuh
+  if (!navigator.onLine) {
+    hideAuthOverlay();
+    return;
+  }
+
+  const savedKey = getStoredAccessKey();
+  try {
+    const headers = { 'Accept': 'application/json' };
+    if (savedKey) headers['X-Access-Key'] = savedKey;
+
+    const res = await fetch(AUTH_ENDPOINT, {
+      method:      'POST',
+      credentials: 'same-origin',
+      headers
+    });
+
+    if (res.ok) {
+      try { localStorage.setItem(AUTH_VERIFIED_STORAGE, '1'); } catch (_) {}
+      hideAuthOverlay();
+      if (cameFromLink) {
+        showToast('🔓 Akses tim berhasil diaktifkan di perangkat ini!', 'success');
+      }
+      return;
+    }
+
+    if (res.status === 401) {
+      showAuthOverlay(savedKey ? 'Kode Akses berubah atau tidak valid. Silakan masukkan kode terbaru.' : '');
+    }
+  } catch (err) {
+    // Jika sinyal tidak stabil (gagal hubungi server), jangan kunci user di lapangan
+    console.warn('[Auth] Offline/unreachable during check, continuing in local mode:', err.message);
+    hideAuthOverlay();
+  }
+}
+
+/**
+ * Handler tombol "Buka Aplikasi" pada layar kunci Kode Akses.
+ */
+async function submitAccessKey() {
+  const inputEl = document.getElementById('auth-key-input');
+  const btnEl   = document.getElementById('btn-auth-submit');
+  if (!inputEl || !btnEl) return;
+
+  const key = extractAccessKey(inputEl.value);
+  if (!key) {
+    showAuthOverlay('Masukkan Kode Akses atau tempel tautan khusus terlebih dahulu.');
+    inputEl.focus();
+    return;
+  }
+
+  if (!navigator.onLine) {
+    // Jika kebetulan sedang offline saat mengisi, simpan dulu untuk dipakai saat online
+    try { localStorage.setItem(ACCESS_KEY_STORAGE, key); } catch (_) {}
+    hideAuthOverlay();
+    showToast('🔑 Kode disimpan secara lokal. Akan diverifikasi saat online.', 'warning');
+    return;
+  }
+
+  const origHtml = btnEl.innerHTML;
+  try {
+    btnEl.disabled  = true;
+    btnEl.innerHTML = '<div class="spinner"></div> Memeriksa…';
+
+    const res = await fetch(AUTH_ENDPOINT, {
+      method:      'POST',
+      credentials: 'same-origin',
+      headers: {
+        'Accept':       'application/json',
+        'X-Access-Key': key
+      }
+    });
+
+    if (res.ok) {
+      try {
+        localStorage.setItem(ACCESS_KEY_STORAGE, key);
+        localStorage.setItem(AUTH_VERIFIED_STORAGE, '1');
+      } catch (_) {}
+      inputEl.value = '';
+      hideAuthOverlay();
+      showToast('✅ Akses diterima! Perangkat ini telah terhubung.', 'success');
+    } else {
+      showAuthOverlay('❌ Kode Akses salah. Periksa kembali tautan dari Admin.');
+    }
+  } catch (err) {
+    showAuthOverlay('Gagal menghubungi server. Periksa koneksi internet Anda.');
+  } finally {
+    btnEl.disabled  = false;
+    btnEl.innerHTML = origHtml;
+  }
+}
 
 // ════════════════════════════════════════════════════════════
 // IndexedDB MANAGER
@@ -519,15 +697,15 @@ async function handleFile(bId, slotIdx, input) {
  * @param {number} slotIdx
  */
 function clearPhoto(bId, slotIdx) {
-  const slotEl   = document.getElementById(`s-${bId}-${slotIdx}`);
-  const prevEl   = document.getElementById(`p-${bId}-${slotIdx}`);
-  const holdEl   = document.getElementById(`h-${bId}-${slotIdx}`);
-  const infoEl   = document.getElementById(`i-${bId}-${slotIdx}`);
-  const clearEl  = document.getElementById(`c-${bId}-${slotIdx}`);
+  const slotEl    = document.getElementById(`s-${bId}-${slotIdx}`);
+  const prevEl    = document.getElementById(`p-${bId}-${slotIdx}`);
+  const holdEl    = document.getElementById(`h-${bId}-${slotIdx}`);
+  const infoEl    = document.getElementById(`i-${bId}-${slotIdx}`);
+  const clearEl   = document.getElementById(`c-${bId}-${slotIdx}`);
   const fileInput = document.getElementById(`f-${bId}-${slotIdx}`);
 
   slotEl.dataset.base64 = '';
-  prevEl.src             = '';
+  prevEl.src            = '';
   prevEl.classList.remove('visible');
   holdEl.classList.remove('hidden');
   clearEl.classList.add('hidden');
@@ -541,7 +719,7 @@ function clearPhoto(bId, slotIdx) {
 // ════════════════════════════════════════════════════════════
 
 /**
- * Membaca semua nilai dari form (slide 1 + semua blok di slide 2)
+ * Membaca semua nilai dari form (identitas + semua blok dokumentasi)
  * dan mengembalikannya sebagai satu objek data.
  * @returns {Object}
  */
@@ -562,8 +740,8 @@ function collectFormData() {
 
     const slots = [];
     slotEls.forEach((slotEl) => {
-      const foto        = slotEl.dataset.base64 || '';
-      const keterangan  = (slotEl.querySelector('.slot-keterangan')?.value || '').trim();
+      const foto       = slotEl.dataset.base64 || '';
+      const keterangan = (slotEl.querySelector('.slot-keterangan')?.value || '').trim();
       slots.push({ foto, keterangan });
     });
 
@@ -628,12 +806,12 @@ async function saveToDevice() {
       return;
     }
 
-    const id = await saveLaporan(data, editingId);
+    await saveLaporan(data, editingId);
     
     if (editingId) {
-      showToast(`✅ Draf berhasil diperbarui!`, 'success');
+      showToast('✅ Draf berhasil diperbarui!', 'success');
     } else {
-      showToast(`✅ Draf berhasil disimpan!`, 'success');
+      showToast('✅ Draf berhasil disimpan!', 'success');
     }
     
     // Kosongkan form setelah berhasil disimpan agar tidak ada duplikasi
@@ -656,7 +834,8 @@ async function saveToDevice() {
 
 /**
  * Mengambil semua record "pending" dari IndexedDB dan mengirimkannya
- * ke backend via POST /api/sync. Jika berhasil, status diubah menjadi "synced".
+ * ke backend via POST /api/sync secara bertahap (1 laporan per request)
+ * agar aman dari timeout Cloudflare (100s) & jaringan seluler tidak stabil.
  */
 async function syncData() {
   if (isSyncing) return; // Cegah double-tap
@@ -674,13 +853,13 @@ async function syncData() {
       // Tapi update editingId agar sinkron
       editingId = null;
     } catch (e) {
-      console.warn("Auto-save gagal:", e);
+      console.warn('Auto-save gagal:', e);
     }
   }
 
   // Cek konektivitas
   if (!navigator.onLine) {
-    showToast('📵 Tidak ada koneksi internet.\nData akan dikirim saat online.', 'warning');
+    showToast('📵 Tidak ada koneksi internet.\nData tetap aman di perangkat & siap dikirim saat online.', 'warning');
     return;
   }
 
@@ -699,57 +878,79 @@ async function syncData() {
       return;
     }
 
-    showToast(`🔄 Mengirim ${pending.length} laporan ke server…`, '');
+    const total      = pending.length;
+    let syncedCount  = 0;
+    let failedCount  = 0;
+    const pdfLinks   = [];
+    let lastErrorMsg = '';
 
-    const response = await fetch(API_ENDPOINT, {
-      method:  'POST',
-      headers: {
+    for (let idx = 0; idx < total; idx++) {
+      const rec = pending[idx];
+      const progressText = total > 1 ? `(${idx + 1}/${total})` : '';
+      btn.innerHTML = `<div class="spinner"></div> Sync ${progressText}…`;
+      showToast(`🔄 Mengirim laporan ${idx + 1} dari ${total} ke server…`, '');
+
+      const headers = {
         'Content-Type': 'application/json',
         'Accept':       'application/json'
-      },
-      body: JSON.stringify({ records: pending })
-    });
+      };
+      const accessKey = getStoredAccessKey();
+      if (accessKey) headers['X-Access-Key'] = accessKey;
 
-    if (!response.ok) {
-      const errText = await response.text();
-      throw new Error(`Server error ${response.status}: ${errText}`);
-    }
+      const response = await fetch(API_ENDPOINT, {
+        method:      'POST',
+        credentials: 'same-origin',
+        headers,
+        body: JSON.stringify({ records: [rec] })
+      });
 
-    const result = await response.json();
-    console.log('[Sync] Server response:', result);
-
-    // Tandai setiap record sebagai synced, sertakan pdfUrl dan docxUrl jika tersedia
-    await Promise.all(pending.map((rec) => {
-      // Cari result yang cocok dengan clientId
-      const serverResult = (result.results || []).find(r => r.clientId === rec.id);
-      
-      // Jika server gagal memproses record ini, jangan tandai sebagai synced
-      if (!serverResult) {
-        console.warn(`Record ${rec.id} gagal diproses oleh server, tetap di status pending.`);
-        return Promise.resolve();
+      if (response.status === 401) {
+        await refreshPendingBadge();
+        showToast('🔒 Kode Akses diperlukan sebelum sinkronisasi.', 'warning', 4500);
+        showAuthOverlay('Masukkan Kode Akses atau tautan resmi dari Admin untuk menyinkronkan data.');
+        return;
       }
 
-      const pdfUrl = serverResult.pdfUrl || null;
+      if (!response.ok) {
+        const errText = await response.text();
+        failedCount++;
+        lastErrorMsg = `HTTP ${response.status}: ${errText.slice(0, 120)}`;
+        console.error(`[Sync] Gagal record ${rec.id}:`, lastErrorMsg);
+        continue;
+      }
+
+      const result = await response.json();
+      const serverResult = (result.results || []).find(r => r.clientId === rec.id) || (result.results || [])[0];
+
+      if (!serverResult) {
+        failedCount++;
+        lastErrorMsg = (result.errors && result.errors[0]?.error) || 'Gagal diproses server.';
+        console.warn(`Record ${rec.id} gagal diproses oleh server, tetap di status pending.`);
+        continue;
+      }
+
+      const pdfUrl  = serverResult.pdfUrl || null;
       const docxUrl = serverResult.docxUrl || null;
-      return markAsSynced(rec.id, pdfUrl, docxUrl);
-    }));
-    await refreshPendingBadge();
-
-    // Tampilkan hasil dengan link PDF
-    const pdfLinks = (result.results || [])
-      .filter(r => r.pdfUrl)
-      .map(r => r.pdfUrl);
-
-    if (pdfLinks.length > 0) {
-      showToast(`✅ ${pending.length} laporan tersinkron!\n📄 PDF & Word siap diunduh — buka panel Data`, 'success', 5000);
-      // Simpan PDF URLs ke sessionStorage agar drawer dapat menampilkannya
-      sessionStorage.setItem('lastSyncPdfUrls', JSON.stringify(pdfLinks));
-    } else {
-      showToast(`✅ ${pending.length} laporan berhasil disinkronisasi!`, 'success');
+      await markAsSynced(rec.id, pdfUrl, docxUrl);
+      syncedCount++;
+      if (pdfUrl) pdfLinks.push(pdfUrl);
+      await refreshPendingBadge();
     }
 
-    // Reset form setelah sinkronisasi berhasil untuk menghindari duplikasi record jika user menekan save lagi
-    resetForm();
+    if (syncedCount > 0 && failedCount === 0) {
+      if (pdfLinks.length > 0) {
+        showToast(`✅ ${syncedCount} laporan tersinkron!\n📄 PDF & Word siap diunduh — buka panel Data`, 'success', 5000);
+        sessionStorage.setItem('lastSyncPdfUrls', JSON.stringify(pdfLinks));
+      } else {
+        showToast(`✅ ${syncedCount} laporan berhasil disinkronisasi!`, 'success');
+      }
+      // Reset form setelah sinkronisasi berhasil untuk menghindari duplikasi record
+      resetForm();
+    } else if (syncedCount > 0 && failedCount > 0) {
+      showToast(`⚠️ ${syncedCount} berhasil, ${failedCount} gagal (${lastErrorMsg}).\nData yang gagal tetap aman di antrean.`, 'warning', 5500);
+    } else {
+      throw new Error(lastErrorMsg || 'Seluruh laporan gagal disinkronisasi.');
+    }
 
   } catch (err) {
     console.error('[Sync] Error:', err);
@@ -770,10 +971,10 @@ function updateOnlineStatus() {
   const text = document.getElementById('status-text');
 
   if (navigator.onLine) {
-    bar.className   = 'status-bar online';
+    bar.className    = 'status-bar online';
     text.textContent = 'Online — Siap melakukan sinkronisasi';
   } else {
-    bar.className   = 'status-bar offline';
+    bar.className    = 'status-bar offline';
     text.textContent = 'Offline — Data disimpan di perangkat';
   }
 }
@@ -903,12 +1104,12 @@ function renderRecordsPanel(records) {
       day: 'numeric', month: 'short', year: 'numeric',
       hour: '2-digit', minute: '2-digit'
     });
-    const blokCount    = rec.blokDokumentasi?.length ?? 0;
-    const statusClass  = rec.status === 'synced' ? 'synced' : 'pending';
-    const statusLabel  = rec.status === 'synced' ? '✓ Tersinkron' : '⏳ Pending';
-    const company      = _esc(rec.namaPerusahaan || '—');
-    const jenis        = _esc(rec.jenisObjek  || '—');
-    const serie        = _esc(rec.noSerie     || '—');
+    const blokCount   = rec.blokDokumentasi?.length ?? 0;
+    const statusClass = rec.status === 'synced' ? 'synced' : 'pending';
+    const statusLabel = rec.status === 'synced' ? '✓ Tersinkron' : '⏳ Pending';
+    const company     = _esc(rec.namaPerusahaan || '—');
+    const jenis       = _esc(rec.jenisObjek  || '—');
+    const serie       = _esc(rec.noSerie     || '—');
 
     // Tombol download PDF (hanya tampil untuk record synced yang punya pdfUrl)
     const pdfBtn = (rec.status === 'synced' && rec.pdfUrl)
@@ -1012,7 +1213,7 @@ async function handleEditRecord(id) {
         return;
       }
       
-      // 1. Populate Slide 1
+      // 1. Populate Identitas
       document.getElementById('nama-perusahaan').value = record.namaPerusahaan || '';
       document.getElementById('jenis-objek').value     = record.jenisObjek || 'Pesawat Angkat & Angkut';
       document.getElementById('no-serie').value        = record.noSerie || '';
@@ -1022,7 +1223,7 @@ async function handleEditRecord(id) {
       blockList.innerHTML = '';
       blockCounter = 0;
       
-      // 3. Populate Slide 2 Blocks
+      // 3. Populate Blocks
       if (record.blokDokumentasi && Array.isArray(record.blokDokumentasi)) {
         record.blokDokumentasi.forEach(blok => {
            addBlock(); 
@@ -1043,11 +1244,11 @@ async function handleEditRecord(id) {
            
            if (blok.slots && Array.isArray(blok.slots)) {
              blok.slots.forEach((slotData, idx) => {
-               const slotEl   = document.getElementById(`s-${bId}-${idx}`);
-               const prevEl   = document.getElementById(`p-${bId}-${idx}`);
-               const holdEl   = document.getElementById(`h-${bId}-${idx}`);
-               const clearEl  = document.getElementById(`c-${bId}-${idx}`);
-               const ketEl    = document.querySelector(`#s-${bId}-${idx} .slot-keterangan`);
+               const slotEl  = document.getElementById(`s-${bId}-${idx}`);
+               const prevEl  = document.getElementById(`p-${bId}-${idx}`);
+               const holdEl  = document.getElementById(`h-${bId}-${idx}`);
+               const clearEl = document.getElementById(`c-${bId}-${idx}`);
+               const ketEl   = document.querySelector(`#s-${bId}-${idx} .slot-keterangan`);
                
                if (slotEl && slotData.foto) {
                  slotEl.dataset.base64 = slotData.foto;
@@ -1189,7 +1390,10 @@ document.addEventListener('DOMContentLoaded', async () => {
   // 1. Daftarkan Service Worker
   registerServiceWorker();
 
-  // 2. Inisialisasi IndexedDB
+  // 2. Periksa Secret Link (?key=...) / Kode Akses Tim
+  initAccessControl();
+
+  // 3. Inisialisasi IndexedDB
   try {
     await initDB();
   } catch (err) {
@@ -1198,9 +1402,10 @@ document.addEventListener('DOMContentLoaded', async () => {
     return;
   }
 
-  // 3. Setup listener online/offline
+  // 4. Setup listener online/offline
   window.addEventListener('online', () => {
     updateOnlineStatus();
+    initAccessControl(); // Segarkan cookie sesi akses di background saat sinyal kembali
     showToast('🟢 Koneksi pulih! Siap sinkronisasi.', 'success');
   });
 
@@ -1209,10 +1414,10 @@ document.addEventListener('DOMContentLoaded', async () => {
     showToast('🔴 Koneksi terputus.\nMode offline aktif — data tetap tersimpan.', 'warning');
   });
 
-  // 4. Set status awal
+  // 5. Set status awal
   updateOnlineStatus();
 
-  // 5. Perbarui badge pending
+  // 6. Perbarui badge pending
   await refreshPendingBadge();
 
   console.log('[App] Ready ✓');

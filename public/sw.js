@@ -1,12 +1,13 @@
 // sw.js — Service Worker untuk Riksa Uji PJK3 PWA
-// Strategi: Cache-First untuk asset UI, bypass untuk API calls
+// Strategi: Cache-First untuk asset UI, bypass untuk API calls & uploads
 'use strict';
 
-const CACHE_NAME = 'riksauji-v15';
+const CACHE_NAME = 'riksauji-v16';
 const STATIC_ASSETS = [
   '/',
   '/index.html',
   '/app.js',
+  '/app.js?v=16',
   '/manifest.json',
   '/icons/icon-192.png',
   '/icons/icon-512.png'
@@ -59,34 +60,43 @@ self.addEventListener('fetch', (event) => {
 
   // Jangan intercept:
   // 1. Request non-GET (POST, dll.)
-  // 2. API calls ke /api/*
-  // 3. Request ke domain lain (external resources)
+  // 2. API calls ke /api/* dan file hasil sync /uploads/*
+  // 3. Request ke domain lain (external resources seperti Google Fonts)
   if (
     request.method !== 'GET' ||
     url.pathname.startsWith('/api/') ||
     url.pathname.startsWith('/uploads/') ||
-    !url.origin.includes(self.location.origin.replace(/^https?:\/\//, ''))
+    url.origin !== self.location.origin
   ) {
     // Biarkan network handle request ini langsung
     return;
   }
 
+  const isNavigation =
+    request.mode === 'navigate' ||
+    (request.headers.get('accept') || '').includes('text/html');
+
   event.respondWith(
     caches.match(request)
+      .then((exactMatch) => {
+        if (exactMatch) return exactMatch;
+        // Fallback ignoreSearch agar /?key=... atau /app.js?v=... tetap kena cache saat offline
+        return caches.match(request, { ignoreSearch: true });
+      })
       .then((cachedResponse) => {
-        // Cache-HIT: kembalikan dari cache
+        // Cache-HIT: kembalikan dari cache, lalu perbarui cache di background
         if (cachedResponse) {
-          // Background update: refresh cache diam-diam
-          const fetchPromise = fetch(request)
+          fetch(request)
             .then((networkResponse) => {
               if (networkResponse && networkResponse.status === 200 && networkResponse.type !== 'opaque') {
-                caches.open(CACHE_NAME).then((cache) => cache.put(request, networkResponse.clone()));
+                // Untuk navigasi dengan ?key=..., simpan sebagai /index.html agar bersih
+                const cacheKey = isNavigation ? '/index.html' : request;
+                caches.open(CACHE_NAME).then((cache) => cache.put(cacheKey, networkResponse.clone()));
               }
-              return networkResponse;
             })
-            .catch(() => {/* ignore network error for background update */});
+            .catch(() => {/* abaikan error network saat offline */});
 
-          return cachedResponse; // Return cache langsung, update berjalan di background
+          return cachedResponse;
         }
 
         // Cache-MISS: ambil dari network, simpan ke cache
@@ -97,8 +107,9 @@ self.addEventListener('fetch', (event) => {
             }
 
             const responseToCache = networkResponse.clone();
+            const cacheKey = isNavigation ? '/index.html' : request;
             caches.open(CACHE_NAME)
-              .then((cache) => cache.put(request, responseToCache))
+              .then((cache) => cache.put(cacheKey, responseToCache))
               .catch((err) => console.warn('[SW] Cache put failed:', err));
 
             return networkResponse;
@@ -106,7 +117,7 @@ self.addEventListener('fetch', (event) => {
           .catch(() => {
             // Network gagal & tidak ada cache:
             // Untuk navigasi (HTML request), kembalikan index.html dari cache
-            if (request.mode === 'navigate' || request.headers.get('accept').includes('text/html')) {
+            if (isNavigation) {
               console.log('[SW] Offline fallback: serving cached index.html');
               return caches.match('/index.html');
             }
