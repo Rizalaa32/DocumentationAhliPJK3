@@ -635,15 +635,15 @@ function _buildSlotHTML(bId, slotIdx, label) {
              onchange="handleFile('${bId}',${slotIdx},this)">
     </div>
 
-    <!-- Action Row: Native <label> untuk Kamera & Galeri terpisah -->
+    <!-- Action Row: Tombol Kamera Live (getUserMedia) & Galeri -->
     <div class="photo-actions" style="margin-top:8px;">
-      <label class="btn-cam" for="${camId}">
+      <button type="button" class="btn-cam" style="min-width:112px;" onclick="openCameraModal('${bId}',${slotIdx})">
         <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
           <path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/>
           <circle cx="12" cy="13" r="4"/>
         </svg>
         Kamera
-      </label>
+      </button>
       <label class="btn-galeri" for="${galId}">
         <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
           <rect x="3" y="3" width="18" height="18" rx="2"/>
@@ -684,6 +684,182 @@ function removeBlock(bId) {
   el.style.transform  = 'scale(0.96)';
   setTimeout(() => el.remove(), 200);
 }
+
+// ════════════════════════════════════════════════════════════
+// IN-APP LIVE CAMERA (WebRTC getUserMedia — jalan online & offline)
+// ════════════════════════════════════════════════════════════
+
+let _camStream     = null;
+let _camTargetBId  = null;
+let _camTargetSlot = null;
+let _camFacingMode = 'environment'; // 'environment' (belakang) | 'user' (depan)
+
+function _stopCameraStream() {
+  if (_camStream) {
+    _camStream.getTracks().forEach((t) => {
+      try { t.stop(); } catch (_) {}
+    });
+    _camStream = null;
+  }
+  const videoEl = document.getElementById('camera-video');
+  if (videoEl) videoEl.srcObject = null;
+}
+
+async function openCameraModal(bId, slotIdx) {
+  _camTargetBId  = bId;
+  _camTargetSlot = slotIdx;
+
+  const camInputId = `cam-${bId}-${slotIdx}`;
+
+  // Jika browser sangat lama & tidak mendukung getUserMedia, fallback ke input file capture
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    const fallbackInput = document.getElementById(camInputId);
+    if (fallbackInput) fallbackInput.click();
+    else showToast('Browser ini tidak mendukung akses kamera langsung.', 'warning');
+    return;
+  }
+
+  const modalEl    = document.getElementById('camera-modal');
+  const fallbackLb = document.getElementById('camera-fallback-label');
+  if (fallbackLb) {
+    fallbackLb.setAttribute('for', camInputId);
+    fallbackLb.onclick = () => setTimeout(() => closeCameraModal(), 150);
+  }
+
+  modalEl.classList.remove('hidden');
+  document.body.style.overflow = 'hidden';
+
+  await startCameraStream();
+}
+
+async function startCameraStream() {
+  _stopCameraStream();
+
+  const videoEl   = document.getElementById('camera-video');
+  const msgBox    = document.getElementById('camera-msg');
+  const msgText   = document.getElementById('camera-msg-text');
+  const shutterEl = document.getElementById('camera-shutter-btn');
+
+  msgBox.classList.remove('hidden');
+  msgText.innerHTML = '⏳ Membuka kamera… Jika muncul pop-up izin, ketuk <strong>Izinkan / Allow</strong>.';
+  shutterEl.disabled = true;
+
+  const attempts = [
+    { audio: false, video: { facingMode: { ideal: _camFacingMode }, width: { ideal: 1600 }, height: { ideal: 1200 } } },
+    { audio: false, video: { facingMode: _camFacingMode } },
+    { audio: false, video: true }
+  ];
+
+  let lastErr = null;
+  for (const constraints of attempts) {
+    try {
+      _camStream = await navigator.mediaDevices.getUserMedia(constraints);
+      break;
+    } catch (err) {
+      lastErr = err;
+      // Jika ditolak izin oleh user/OS, tidak perlu mencoba constraint lain
+      if (err && (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError')) {
+        break;
+      }
+    }
+  }
+
+  if (!_camStream) {
+    console.warn('[Camera] getUserMedia error:', lastErr);
+    if (lastErr && (lastErr.name === 'NotAllowedError' || lastErr.name === 'PermissionDeniedError')) {
+      msgText.innerHTML =
+        '🔒 <strong>Izin Kamera Diblokir di Browser / HP Anda</strong><br><br>' +
+        '1. Ketuk ikon <strong>Pengaturan / Gembok</strong> di sebelah kiri alamat <code>ahlirakana.my.id</code> di atas ➔ <strong>Izin (Permissions)</strong> ➔ aktifkan <strong>Kamera</strong>.<br>' +
+        '2. Pastikan aplikasi <strong>Chrome / Safari</strong> sudah diberi izin Kamera di Pengaturan HP Anda.';
+    } else if (lastErr && lastErr.name === 'NotFoundError') {
+      msgText.innerHTML = '❌ Kamera tidak ditemukan pada perangkat ini.';
+    } else {
+      msgText.innerHTML = `❌ Gagal mengakses kamera (${lastErr ? lastErr.name : 'Unknown'}). Pastikan kamera tidak sedang dipakai aplikasi lain.`;
+    }
+    return;
+  }
+
+  try {
+    videoEl.srcObject = _camStream;
+    await videoEl.play();
+    msgBox.classList.add('hidden');
+    shutterEl.disabled = false;
+  } catch (playErr) {
+    console.error('[Camera] Video play error:', playErr);
+    msgText.textContent = 'Gagal menampilkan pratinjau kamera.';
+  }
+}
+
+async function retryCameraStream() {
+  await startCameraStream();
+}
+
+async function switchCameraFacing() {
+  _camFacingMode = _camFacingMode === 'environment' ? 'user' : 'environment';
+  await startCameraStream();
+}
+
+function captureFromCamera() {
+  const videoEl = document.getElementById('camera-video');
+  if (!videoEl || !videoEl.videoWidth || !videoEl.videoHeight) {
+    showToast('⚠️ Kamera belum siap, tunggu sebentar.', 'warning');
+    return;
+  }
+
+  const bId     = _camTargetBId;
+  const slotIdx = _camTargetSlot;
+  if (!bId || slotIdx === null) return;
+
+  let width  = videoEl.videoWidth;
+  let height = videoEl.videoHeight;
+
+  if (width > MAX_IMAGE_DIM || height > MAX_IMAGE_DIM) {
+    const ratio = Math.min(MAX_IMAGE_DIM / width, MAX_IMAGE_DIM / height);
+    width  = Math.round(width  * ratio);
+    height = Math.round(height * ratio);
+  }
+
+  const canvas = document.createElement('canvas');
+  canvas.width  = width;
+  canvas.height = height;
+  const ctx = canvas.getContext('2d');
+  ctx.drawImage(videoEl, 0, 0, width, height);
+
+  const base64       = canvas.toDataURL('image/jpeg', JPEG_QUALITY);
+  const compressedKB = Math.round((base64.length * 0.75) / 1024);
+
+  const slotEl  = document.getElementById(`s-${bId}-${slotIdx}`);
+  const prevEl  = document.getElementById(`p-${bId}-${slotIdx}`);
+  const holdEl  = document.getElementById(`h-${bId}-${slotIdx}`);
+  const infoEl  = document.getElementById(`i-${bId}-${slotIdx}`);
+  const clearEl = document.getElementById(`c-${bId}-${slotIdx}`);
+
+  if (slotEl)  slotEl.dataset.base64 = base64;
+  if (prevEl)  { prevEl.src = base64; prevEl.classList.add('visible'); }
+  if (holdEl)  holdEl.classList.add('hidden');
+  if (clearEl) clearEl.classList.remove('hidden');
+  if (infoEl) {
+    infoEl.style.color = 'var(--success)';
+    infoEl.textContent = `✅ Foto kamera tersimpan (${compressedKB} KB | ${width}×${height}px)`;
+  }
+
+  closeCameraModal();
+}
+
+function closeCameraModal() {
+  _stopCameraStream();
+  const modalEl = document.getElementById('camera-modal');
+  if (modalEl) modalEl.classList.add('hidden');
+  if (!document.getElementById('records-drawer')?.classList.contains('open')) {
+    document.body.style.overflow = '';
+  }
+}
+
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden && _camStream) {
+    closeCameraModal();
+  }
+});
 
 // ════════════════════════════════════════════════════════════
 // HANDLE FILE INPUT & KOMPRESI

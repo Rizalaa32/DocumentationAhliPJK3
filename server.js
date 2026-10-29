@@ -136,8 +136,9 @@ app.get('/sw.js', (req, res, next) => {
   next();
 });
 
-// Set cookie akses otomatis saat pertama kali dibuka via secret link (?key=...)
+// Set cookie akses otomatis saat pertama kali dibuka via secret link (?key=...) & izinkan kamera origin sendiri
 app.use((req, res, next) => {
+  res.setHeader('Permissions-Policy', 'camera=(self)');
   if (ACCESS_KEY && req.method === 'GET' && req.query && req.query.key && isAuthorized(req)) {
     setAuthCookie(req, res);
   }
