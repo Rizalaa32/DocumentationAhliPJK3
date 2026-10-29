@@ -286,7 +286,8 @@ function generateBase6Grid(blok, imagePaths, baseUrl) {
     <tr style="page-break-before:avoid; break-before:avoid; page-break-inside:avoid; break-inside:avoid;">`;
 
   (blok.slots || []).forEach((slot, idx) => {
-    const imgData = imagePaths[idx];
+    const rawImg = imagePaths[idx];
+    const imgData = typeof rawImg === 'string' ? { relPath: rawImg } : rawImg;
     let imgSrc = null;
     let actualW = 0, actualH = 0;
     if (imgData && imgData.relPath) {
@@ -375,6 +376,20 @@ async function getBrowser() {
   };
   if (process.env.PUPPETEER_EXECUTABLE_PATH) {
     launchOpts.executablePath = process.env.PUPPETEER_EXECUTABLE_PATH;
+  } else {
+    try {
+      const defaultPath = puppeteer.executablePath();
+      if (!defaultPath || !fs.existsSync(defaultPath)) {
+        const candidates = [
+          '/usr/bin/google-chrome-stable',
+          '/usr/bin/google-chrome',
+          '/usr/bin/chromium-browser',
+          '/usr/bin/chromium'
+        ];
+        const found = candidates.find(p => fs.existsSync(p));
+        if (found) launchOpts.executablePath = found;
+      }
+    } catch (_) {}
   }
   _browser = await puppeteer.launch(launchOpts);
   console.log('[PDF] Puppeteer browser launched.');
@@ -425,9 +440,17 @@ async function generatePDF(htmlContent, outputPath) {
  */
 async function generateDocx(htmlContent, outputPath) {
   try {
-    const blob = htmlDocx.asBlob(htmlContent);
-    const arrayBuffer = await blob.arrayBuffer();
-    fs.writeFileSync(outputPath, Buffer.from(arrayBuffer));
+    const out = htmlDocx.asBlob(htmlContent);
+    let buf;
+    if (Buffer.isBuffer(out)) {
+      buf = out;
+    } else if (out && typeof out.arrayBuffer === 'function') {
+      const arrayBuffer = await out.arrayBuffer();
+      buf = Buffer.from(arrayBuffer);
+    } else {
+      buf = Buffer.from(out);
+    }
+    fs.writeFileSync(outputPath, buf);
     console.log('[DOCX] Generated:', outputPath);
     return outputPath;
   } catch (err) {
@@ -522,6 +545,129 @@ app.all('/api/auth', (req, res) => {
  *     errors:    [...] | undefined
  *   }
  */
+function buildFullHtmlDoc(record, allRows) {
+  return `
+<!DOCTYPE html>
+<html lang="id">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Lampiran Riksa Uji — ${esc(record.jenisObjek)} — ${esc(record.namaPerusahaan)}</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      font-family: Arial, Helvetica, sans-serif;
+      margin: 0; padding: 20px;
+      color: #0F172A; background: #fff;
+      font-size: 12px;
+    }
+    table { border-collapse: collapse; }
+    img   { max-width: 100%; height: auto; }
+  </style>
+</head>
+<body>
+
+  <!-- JUDUL LAMPIRAN -->
+  <p style="text-align:center; font-weight:bold; font-size:14px;
+            letter-spacing:0.06em; margin:0 0 24px;">
+    LAMPIRAN
+  </p>
+
+  <!-- IDENTITAS (justify kiri dengan lebar kolom seragam) -->
+  <table style="margin-bottom:20px; border:none; line-height:1.2;">
+    <tr>
+      <td style="width:155px; padding:0; vertical-align:top; height:18px;">Nama Perusahaan</td>
+      <td style="padding:0 10px; vertical-align:top; height:18px;">:</td>
+      <td style="padding:0; vertical-align:top; height:18px;">${esc(record.namaPerusahaan)}</td>
+    </tr>
+    <tr>
+      <td style="padding:0; vertical-align:top; height:18px;">Jenis Objek K3</td>
+      <td style="padding:0 10px; vertical-align:top; height:18px;">:</td>
+      <td style="padding:0; vertical-align:top; height:18px;">${esc(record.jenisObjek)}</td>
+    </tr>
+    <tr>
+      <td style="padding:0; vertical-align:top; height:18px;">No. Serie</td>
+      <td style="padding:0 10px; vertical-align:top; height:18px;">:</td>
+      <td style="padding:0; vertical-align:top; height:18px;">${esc(record.noSerie)}</td>
+    </tr>
+  </table>
+
+  <!-- TABEL DOKUMENTASI (MASING-MASING BLOK PUNYA TABEL SENDIRI) -->
+  <div style="width:100%;">
+    ${allRows}
+  </div>
+
+</body>
+</html>`;
+}
+
+function resolveSafeSessionDir(rawSerie, rawSessionTs) {
+  const safeSerie = sanitizePath(rawSerie);
+  const sessionTs = String(rawSessionTs || '').trim();
+  if (!safeSerie || safeSerie !== rawSerie || !/^\d+$/.test(sessionTs)) {
+    return null;
+  }
+  const uploadsRoot = path.resolve(UPLOADS);
+  const sessionDir  = path.resolve(UPLOADS, safeSerie, sessionTs);
+  if (!sessionDir.startsWith(uploadsRoot + path.sep)) {
+    return null;
+  }
+  return { safeSerie, sessionTs, sessionDir };
+}
+
+function readServerSessionSummary(safeSerie, sessionTs, baseUrl) {
+  const sessionDir = path.join(UPLOADS, safeSerie, sessionTs);
+  if (!fs.existsSync(sessionDir) || !fs.statSync(sessionDir).isDirectory()) return null;
+
+  const entries  = fs.readdirSync(sessionDir);
+  const pdfFile  = entries.find(f => /\.pdf$/i.test(f)) || null;
+  const docxFile = entries.find(f => /\.docx$/i.test(f)) || null;
+  const blokDirs = entries
+    .filter(f => /^blok_\d+$/i.test(f) && fs.statSync(path.join(sessionDir, f)).isDirectory())
+    .sort((a, b) => parseInt(a.split('_')[1], 10) - parseInt(b.split('_')[1], 10));
+
+  const metaPath = path.join(sessionDir, 'meta.json');
+  let meta = null;
+  if (fs.existsSync(metaPath)) {
+    try {
+      meta = JSON.parse(fs.readFileSync(metaPath, 'utf8'));
+    } catch (_) {}
+  }
+
+  let fallbackCompany = `Laporan (SN: ${safeSerie})`;
+  let fallbackJenis   = 'Dokumentasi Riksa Uji';
+  if (!meta && docxFile) {
+    try {
+      const raw = fs.readFileSync(path.join(sessionDir, docxFile)).toString('utf8');
+      const m = raw.match(/<title>Lampiran Riksa Uji\s*(?:—|&mdash;)\s*([^<]+?)\s*(?:—|&mdash;)\s*([^<]+?)<\/title>/);
+      if (m) {
+        fallbackJenis   = m[1].trim();
+        fallbackCompany = m[2].trim();
+      }
+    } catch (_) {}
+  }
+
+  const pdfRel  = pdfFile  ? `${safeSerie}/${sessionTs}/${pdfFile}`  : null;
+  const docxRel = docxFile ? `${safeSerie}/${sessionTs}/${docxFile}` : null;
+  const tsNum   = parseInt(sessionTs, 10);
+  const savedAt = (meta && meta.savedAt)
+    || (!isNaN(tsNum) ? new Date(tsNum).toISOString() : fs.statSync(sessionDir).mtime.toISOString());
+
+  return {
+    serverKey:      `${safeSerie}/${sessionTs}`,
+    safeSerie,
+    sessionTs:      String(sessionTs),
+    namaPerusahaan: (meta && meta.namaPerusahaan) || fallbackCompany,
+    jenisObjek:     (meta && meta.jenisObjek)     || fallbackJenis,
+    noSerie:        (meta && meta.noSerie)        || safeSerie,
+    bloksCount:     (meta && typeof meta.bloksCount === 'number') ? meta.bloksCount : blokDirs.length,
+    savedAt,
+    pdfUrl:         pdfRel  ? `${baseUrl}/uploads/${pdfRel}`  : null,
+    docxUrl:        docxRel ? `${baseUrl}/uploads/${docxRel}` : null,
+    hasMeta:        Boolean(meta)
+  };
+}
+
 app.post('/api/sync', requireAccessKey, async (req, res) => {
   const { records } = req.body;
 
@@ -533,13 +679,14 @@ app.post('/api/sync', requireAccessKey, async (req, res) => {
     });
   }
 
-  const results   = [];
-  const errors    = [];
-  const baseUrl   = getBaseUrl(req);
-  const sessionTs = Date.now(); // Timestamp sesi sinkronisasi ini
+  const results = [];
+  const errors  = [];
+  const baseUrl = getBaseUrl(req);
+  const batchTs = Date.now(); // Timestamp dasar sesi sinkronisasi ini
 
   for (let rIdx = 0; rIdx < records.length; rIdx++) {
-    const record = records[rIdx];
+    const record    = records[rIdx];
+    const sessionTs = batchTs + rIdx;
     try {
       // Validasi field wajib per record
       if (!record.noSerie || !record.namaPerusahaan) {
@@ -595,76 +742,18 @@ app.post('/api/sync', requireAccessKey, async (req, res) => {
         });
       }
 
-      // Susun dokumen HTML lengkap untuk seluruh record ini
-      const createdDate = record.createdAt
-        ? new Date(record.createdAt).toLocaleDateString('id-ID', {
-            weekday: 'long', year: 'numeric', month: 'long', day: 'numeric'
-          })
-        : 'Tanggal tidak diketahui';
-
       // Gabungkan semua blok menjadi baris-baris dalam SATU tabel utuh
-      const allRows = processedBlocks.map(b => b.htmlGrid).join('\n');
+      const allRows     = processedBlocks.map(b => b.htmlGrid).join('\n');
+      const fullHtmlDoc = buildFullHtmlDoc(record, allRows);
 
-      const fullHtmlDoc = `
-<!DOCTYPE html>
-<html lang="id">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Lampiran Riksa Uji — ${esc(record.jenisObjek)} — ${esc(record.namaPerusahaan)}</title>
-  <style>
-    * { box-sizing: border-box; }
-    body {
-      font-family: Arial, Helvetica, sans-serif;
-      margin: 0; padding: 20px;
-      color: #0F172A; background: #fff;
-      font-size: 12px;
-    }
-    table { border-collapse: collapse; }
-    img   { max-width: 100%; height: auto; }
-  </style>
-</head>
-<body>
-
-  <!-- JUDUL LAMPIRAN -->
-  <p style="text-align:center; font-weight:bold; font-size:14px;
-            letter-spacing:0.06em; margin:0 0 24px;">
-    LAMPIRAN
-  </p>
-
-  <!-- IDENTITAS (justify kiri dengan lebar kolom seragam) -->
-  <table style="margin-bottom:20px; border:none; line-height:1.2;">
-    <tr>
-      <td style="width:155px; padding:0; vertical-align:top; height:18px;">Nama Perusahaan</td>
-      <td style="padding:0 10px; vertical-align:top; height:18px;">:</td>
-      <td style="padding:0; vertical-align:top; height:18px;">${esc(record.namaPerusahaan)}</td>
-    </tr>
-    <tr>
-      <td style="padding:0; vertical-align:top; height:18px;">Jenis Objek K3</td>
-      <td style="padding:0 10px; vertical-align:top; height:18px;">:</td>
-      <td style="padding:0; vertical-align:top; height:18px;">${esc(record.jenisObjek)}</td>
-    </tr>
-    <tr>
-      <td style="padding:0; vertical-align:top; height:18px;">No. Serie</td>
-      <td style="padding:0 10px; vertical-align:top; height:18px;">:</td>
-      <td style="padding:0; vertical-align:top; height:18px;">${esc(record.noSerie)}</td>
-    </tr>
-  </table>
-
-  <!-- TABEL DOKUMENTASI (MASING-MASING BLOK PUNYA TABEL SENDIRI) -->
-  <div style="width:100%;">
-    ${allRows}
-  </div>
-
-</body>
-</html>`;
+      fs.mkdirSync(recordDir, { recursive: true });
+      fs.writeFileSync(path.join(recordDir, 'laporan_source.html'), fullHtmlDoc, 'utf8');
 
       // ── Generate PDF ──
       let pdfUrl   = null;
       let pdfPath  = null;
       const pdfFilename  = `laporan_${safeSerie}_${sessionTs}.pdf`;
       const pdfAbsPath   = path.join(recordDir, pdfFilename);
-      fs.mkdirSync(recordDir, { recursive: true });
       
       try {
         await generatePDF(fullHtmlDoc, pdfAbsPath);
@@ -692,8 +781,45 @@ app.post('/api/sync', requireAccessKey, async (req, res) => {
         console.warn(`[DOCX] ✗ Generation failed for record ${rIdx + 1}:`, genErr.message);
       }
 
+      const savedAtIso = new Date().toISOString();
+
+      // Simpan metadata ringan untuk Arsip Server lintas perangkat (PC / HP lain)
+      const metaObj = {
+        safeSerie,
+        sessionTs:      String(sessionTs),
+        clientId:       record.id,
+        namaPerusahaan: record.namaPerusahaan || '',
+        jenisObjek:     record.jenisObjek || '',
+        noSerie:        record.noSerie || safeSerie,
+        createdAt:      record.createdAt || savedAtIso,
+        savedAt:        savedAtIso,
+        bloksCount:     processedBlocks.length,
+        pdfRel:         pdfPath,
+        docxRel:        docxPath,
+        bloks:          (record.blokDokumentasi || []).map((b, bIdx) => ({
+          blokNumber: bIdx + 1,
+          judul:      b.judul || '',
+          layout:     b.layout || '1col',
+          slots:      (b.slots || []).map((s, sIdx) => {
+            const imgInfo = processedBlocks[bIdx] && processedBlocks[bIdx].imagePaths
+              ? processedBlocks[bIdx].imagePaths[sIdx]
+              : null;
+            return {
+              keterangan:   s.keterangan || '',
+              imageRelPath: imgInfo ? imgInfo.relPath : null,
+              width:        imgInfo ? imgInfo.width : 0,
+              height:       imgInfo ? imgInfo.height : 0
+            };
+          })
+        }))
+      };
+      fs.writeFileSync(path.join(recordDir, 'meta.json'), JSON.stringify(metaObj, null, 2), 'utf8');
+
       results.push({
         clientId:       record.id,
+        serverKey:      `${safeSerie}/${sessionTs}`,
+        safeSerie,
+        sessionTs:      String(sessionTs),
         noSerie:        record.noSerie,
         namaPerusahaan: record.namaPerusahaan,
         jenisObjek:     record.jenisObjek,
@@ -704,7 +830,7 @@ app.post('/api/sync', requireAccessKey, async (req, res) => {
         pdfPath,
         docxUrl,
         docxPath,
-        savedAt: new Date().toISOString()
+        savedAt: savedAtIso
       });
 
       console.log(`[Sync] ✓ Record ${rIdx + 1}: ${record.noSerie} — ${processedBlocks.length} blok, PDF: ${pdfUrl ? 'OK' : 'SKIP'}.`);
@@ -728,6 +854,244 @@ app.post('/api/sync', requireAccessKey, async (req, res) => {
     errors:    errors.length > 0 ? errors : undefined,
     timestamp: new Date().toISOString()
   });
+});
+
+/**
+ * GET /api/server-records
+ * Mengambil seluruh daftar arsip laporan yang sudah tersinkron di server
+ * agar bisa dilihat & diunduh dari perangkat lain (mis. PC Kantor / Admin).
+ */
+app.get('/api/server-records', requireAccessKey, (req, res) => {
+  try {
+    const baseUrl = getBaseUrl(req);
+    if (!fs.existsSync(UPLOADS)) {
+      return res.json({ success: true, count: 0, records: [] });
+    }
+
+    const list = [];
+    const serieDirs = fs.readdirSync(UPLOADS).filter((d) => {
+      const full = path.join(UPLOADS, d);
+      return fs.existsSync(full) && fs.statSync(full).isDirectory();
+    });
+
+    for (const safeSerie of serieDirs) {
+      const seriePath = path.join(UPLOADS, safeSerie);
+      const sessionDirs = fs.readdirSync(seriePath).filter((s) => {
+        const full = path.join(seriePath, s);
+        return /^\d+$/.test(s) && fs.existsSync(full) && fs.statSync(full).isDirectory();
+      });
+
+      for (const sessionTs of sessionDirs) {
+        const summary = readServerSessionSummary(safeSerie, sessionTs, baseUrl);
+        if (summary) list.push(summary);
+      }
+    }
+
+    list.sort((a, b) => Number(b.sessionTs) - Number(a.sessionTs));
+    res.json({ success: true, count: list.length, records: list });
+  } catch (err) {
+    console.error('[ServerRecords] List error:', err);
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+/**
+ * GET /api/server-records/:safeSerie/:sessionTs/detail
+ * Memuat isi lengkap laporan dari server (termasuk foto & keterangan)
+ * agar bisa dibuka / disunting ulang dari PC maupun perangkat lain.
+ */
+app.get('/api/server-records/:safeSerie/:sessionTs/detail', requireAccessKey, (req, res) => {
+  const resolved = resolveSafeSessionDir(req.params.safeSerie, req.params.sessionTs);
+  if (!resolved || !fs.existsSync(resolved.sessionDir)) {
+    return res.status(404).json({ success: false, message: 'Arsip laporan tidak ditemukan di server.' });
+  }
+
+  try {
+    const { safeSerie, sessionTs, sessionDir } = resolved;
+    const baseUrl  = getBaseUrl(req);
+    const summary  = readServerSessionSummary(safeSerie, sessionTs, baseUrl);
+    const metaPath = path.join(sessionDir, 'meta.json');
+
+    let blokDokumentasi = [];
+    if (fs.existsSync(metaPath)) {
+      const meta = JSON.parse(fs.readFileSync(metaPath, 'utf8'));
+      blokDokumentasi = (meta.bloks || []).map((b) => ({
+        judul:  b.judul || '',
+        layout: b.layout || '1col',
+        slots:  (b.slots || []).map((s) => {
+          let foto = null;
+          if (s.imageRelPath) {
+            const imgAbs = path.join(UPLOADS, s.imageRelPath);
+            if (fs.existsSync(imgAbs)) {
+              foto = `data:image/jpeg;base64,${fs.readFileSync(imgAbs).toString('base64')}`;
+            }
+          }
+          return { foto, keterangan: s.keterangan || '' };
+        })
+      }));
+    } else {
+      // Fallback untuk arsip lama sebelum ada meta.json
+      const blokDirs = fs.readdirSync(sessionDir)
+        .filter(f => /^blok_\d+$/i.test(f) && fs.statSync(path.join(sessionDir, f)).isDirectory())
+        .sort((a, b) => parseInt(a.split('_')[1], 10) - parseInt(b.split('_')[1], 10));
+
+      blokDokumentasi = blokDirs.map((bDir, idx) => {
+        const bPath = path.join(sessionDir, bDir);
+        const imgs  = fs.readdirSync(bPath).filter(f => /\.(jpg|jpeg|png)$/i.test(f)).sort();
+        const layout = imgs.length >= 3 ? '3col' : imgs.length === 2 ? '2col' : '1col';
+        const slotTotal = layout === '3col' ? 3 : layout === '2col' ? 2 : 1;
+        const slots = [];
+        for (let i = 0; i < slotTotal; i++) {
+          let foto = null;
+          if (imgs[i]) {
+            const imgAbs = path.join(bPath, imgs[i]);
+            foto = `data:image/jpeg;base64,${fs.readFileSync(imgAbs).toString('base64')}`;
+          }
+          slots.push({ foto, keterangan: '' });
+        }
+        return { judul: `Pemeriksaan ${idx + 1}`, layout, slots };
+      });
+    }
+
+    res.json({
+      success: true,
+      record: {
+        serverKey:       `${safeSerie}/${sessionTs}`,
+        namaPerusahaan:  summary ? summary.namaPerusahaan : '',
+        jenisObjek:      summary ? summary.jenisObjek : 'Pesawat Angkat & Angkut',
+        noSerie:         summary ? summary.noSerie : safeSerie,
+        status:          'synced',
+        createdAt:       summary ? summary.savedAt : new Date().toISOString(),
+        blokDokumentasi
+      }
+    });
+  } catch (err) {
+    console.error('[ServerRecords] Detail error:', err);
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+/**
+ * POST /api/server-records/:safeSerie/:sessionTs/regenerate
+ * Membuat ulang file PDF & Word langsung di server tanpa perlu upload ulang dari HP.
+ */
+app.post('/api/server-records/:safeSerie/:sessionTs/regenerate', requireAccessKey, async (req, res) => {
+  const resolved = resolveSafeSessionDir(req.params.safeSerie, req.params.sessionTs);
+  if (!resolved || !fs.existsSync(resolved.sessionDir)) {
+    return res.status(404).json({ success: false, message: 'Arsip laporan tidak ditemukan di server.' });
+  }
+
+  try {
+    const { safeSerie, sessionTs, sessionDir } = resolved;
+    const baseUrl    = getBaseUrl(req);
+    const sourcePath = path.join(sessionDir, 'laporan_source.html');
+    const metaPath   = path.join(sessionDir, 'meta.json');
+
+    let fullHtmlDoc = null;
+    let meta        = null;
+
+    if (fs.existsSync(metaPath)) {
+      try { meta = JSON.parse(fs.readFileSync(metaPath, 'utf8')); } catch (_) {}
+    }
+
+    if (fs.existsSync(sourcePath)) {
+      fullHtmlDoc = fs.readFileSync(sourcePath, 'utf8');
+    } else if (meta && Array.isArray(meta.bloks)) {
+      const rows = meta.bloks.map((b) => {
+        const imagePaths = (b.slots || []).map(s =>
+          s.imageRelPath ? { relPath: s.imageRelPath, width: s.width || 0, height: s.height || 0 } : null
+        );
+        return generateBase6Grid(b, imagePaths, baseUrl);
+      }).join('\n');
+      fullHtmlDoc = buildFullHtmlDoc(meta, rows);
+      fs.writeFileSync(sourcePath, fullHtmlDoc, 'utf8');
+    } else {
+      const summary = readServerSessionSummary(safeSerie, sessionTs, baseUrl) || {
+        namaPerusahaan: `Laporan (SN: ${safeSerie})`,
+        jenisObjek:     'Dokumentasi Riksa Uji',
+        noSerie:        safeSerie
+      };
+      const blokDirs = fs.readdirSync(sessionDir)
+        .filter(f => /^blok_\d+$/i.test(f) && fs.statSync(path.join(sessionDir, f)).isDirectory())
+        .sort((a, b) => parseInt(a.split('_')[1], 10) - parseInt(b.split('_')[1], 10));
+
+      const rows = blokDirs.map((bDir, idx) => {
+        const bPath = path.join(sessionDir, bDir);
+        const imgs  = fs.readdirSync(bPath).filter(f => /\.(jpg|jpeg|png)$/i.test(f)).sort();
+        const layout = imgs.length >= 3 ? '3col' : imgs.length === 2 ? '2col' : '1col';
+        const rels   = imgs.map(f => `${safeSerie}/${sessionTs}/${bDir}/${f}`);
+        const blok   = {
+          judul:  `Pemeriksaan ${idx + 1}`,
+          layout,
+          slots:  rels.map(() => ({ keterangan: '' }))
+        };
+        return generateBase6Grid(blok, rels, baseUrl);
+      }).join('\n');
+      fullHtmlDoc = buildFullHtmlDoc(summary, rows);
+    }
+
+    const pdfFilename  = `laporan_${safeSerie}_${sessionTs}.pdf`;
+    const pdfAbsPath   = path.join(sessionDir, pdfFilename);
+    const docxFilename = `laporan_${safeSerie}_${sessionTs}.docx`;
+    const docxAbsPath  = path.join(sessionDir, docxFilename);
+
+    let pdfError  = null;
+    let docxError = null;
+
+    try {
+      await generatePDF(fullHtmlDoc, pdfAbsPath);
+    } catch (e) {
+      pdfError = e.message;
+      console.warn('[Regenerate PDF] Failed:', e.message);
+    }
+
+    try {
+      await generateDocx(fullHtmlDoc, docxAbsPath);
+    } catch (e) {
+      docxError = e.message;
+      console.warn('[Regenerate DOCX] Failed:', e.message);
+    }
+
+    if (meta) {
+      if (!pdfError)  meta.pdfRel  = `${safeSerie}/${sessionTs}/${pdfFilename}`;
+      if (!docxError) meta.docxRel = `${safeSerie}/${sessionTs}/${docxFilename}`;
+      fs.writeFileSync(metaPath, JSON.stringify(meta, null, 2), 'utf8');
+    }
+
+    const updated = readServerSessionSummary(safeSerie, sessionTs, baseUrl);
+    res.json({
+      success:   !pdfError || !docxError,
+      record:    updated,
+      pdfError,
+      docxError
+    });
+  } catch (err) {
+    console.error('[ServerRecords] Regenerate error:', err);
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+/**
+ * POST /api/server-records/:safeSerie/:sessionTs/delete
+ * Menghapus satu arsip laporan beserta foto, PDF, dan Word dari server.
+ */
+app.post('/api/server-records/:safeSerie/:sessionTs/delete', requireAccessKey, (req, res) => {
+  const resolved = resolveSafeSessionDir(req.params.safeSerie, req.params.sessionTs);
+  if (!resolved || !fs.existsSync(resolved.sessionDir)) {
+    return res.status(404).json({ success: false, message: 'Arsip laporan tidak ditemukan di server.' });
+  }
+
+  try {
+    fs.rmSync(resolved.sessionDir, { recursive: true, force: true });
+    const serieDir = path.join(UPLOADS, resolved.safeSerie);
+    if (fs.existsSync(serieDir) && fs.readdirSync(serieDir).length === 0) {
+      fs.rmdirSync(serieDir);
+    }
+    res.json({ success: true, message: 'Arsip berhasil dihapus dari server.' });
+  } catch (err) {
+    console.error('[ServerRecords] Delete error:', err);
+    res.status(500).json({ success: false, message: err.message });
+  }
 });
 
 /**

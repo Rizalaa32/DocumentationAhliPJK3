@@ -754,7 +754,7 @@
       box-shadow: var(--sh-lg);
       opacity: 0;
       transition: opacity 0.28s, transform 0.28s;
-      z-index: 600;
+      z-index: 3000;
       pointer-events: none;
       max-width: calc(100% - 32px);
       text-align: center;
@@ -773,7 +773,7 @@
       position: fixed;
       inset: 0;
       background: rgba(0,0,0,0.45);
-      z-index: 300;
+      z-index: 1200;
       opacity: 0;
       pointer-events: none;
       transition: opacity 0.3s;
@@ -789,7 +789,7 @@
       max-width: 600px;
       background: var(--card);
       border-radius: var(--r-lg) var(--r-lg) 0 0;
-      z-index: 400;
+      z-index: 1300;
       transition: transform 0.35s cubic-bezier(0.4, 0, 0.2, 1);
       max-height: 78vh;
       display: flex;
@@ -834,11 +834,63 @@
     }
     .drawer-close:hover { background: var(--border-light); }
 
+    .drawer-tabs {
+      display: flex;
+      gap: 6px;
+      padding: 10px 16px 0;
+      background: var(--card);
+      flex-shrink: 0;
+    }
+
+    .drawer-tab {
+      flex: 1;
+      border: 1px solid var(--border);
+      background: var(--bg);
+      color: var(--text-sec);
+      border-radius: 8px;
+      padding: 8px 10px;
+      font-size: 12.5px;
+      font-weight: 700;
+      font-family: inherit;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      transition: var(--ease);
+    }
+
+    .drawer-tab.active {
+      background: var(--primary);
+      color: #fff;
+      border-color: var(--primary);
+    }
+
+    .drawer-tab-count {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 18px;
+      height: 18px;
+      padding: 0 5px;
+      border-radius: 999px;
+      font-size: 11px;
+      font-weight: 800;
+      background: rgba(15, 23, 42, 0.08);
+      color: inherit;
+    }
+
+    .drawer-tab.active .drawer-tab-count {
+      background: rgba(255, 255, 255, 0.24);
+      color: #fff;
+    }
+
     .drawer-body {
       overflow-y: auto;
       padding: 14px 16px;
       flex: 1;
       -webkit-overflow-scrolling: touch;
+      padding-bottom: calc(28px + env(safe-area-inset-bottom, 0px));
     }
 
     /* ═══════════════════════════════════════
@@ -1282,9 +1334,17 @@
   <div class="drawer" id="records-drawer" role="dialog" aria-modal="true" aria-label="Data Tersimpan">
     <div class="drawer-handle"></div>
     <div class="drawer-header">
-      <span class="drawer-title">📁 Data Tersimpan di Perangkat</span>
+      <span class="drawer-title">📁 Data &amp; Arsip Laporan</span>
       <button class="drawer-close" onclick="closeDrawer()" aria-label="Tutup panel">
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+      </button>
+    </div>
+    <div class="drawer-tabs" role="tablist" aria-label="Sumber data laporan">
+      <button type="button" class="drawer-tab active" id="tab-local" onclick="switchDrawerTab('local')">
+        📱 Perangkat Ini <span class="drawer-tab-count" id="count-local">0</span>
+      </button>
+      <button type="button" class="drawer-tab" id="tab-server" onclick="switchDrawerTab('server')">
+        ☁️ Arsip Server <span class="drawer-tab-count" id="count-server">0</span>
       </button>
     </div>
     <div class="drawer-body" id="records-list">
@@ -1340,6 +1400,6 @@
     </div>
   </div>
 
-  <script src="/app.js?v=18"></script>
+  <script src="/app.js?v=20"></script>
 </body>
 </html>

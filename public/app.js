@@ -1168,10 +1168,11 @@ async function syncData() {
         showToast(`✅ ${syncedCount} laporan tersinkron!\n📄 PDF & Word siap diunduh — buka panel Data`, 'success', 5000);
         sessionStorage.setItem('lastSyncPdfUrls', JSON.stringify(pdfLinks));
       } else {
-        showToast(`✅ ${syncedCount} laporan berhasil disinkronisasi!`, 'success');
+        showToast(`✅ ${syncedCount} laporan berhasil disinkronisasi!\nBuka panel Data untuk mengunduh dokumen.`, 'success', 5000);
       }
       // Reset form setelah sinkronisasi berhasil untuk menghindari duplikasi record
       resetForm();
+      if (navigator.onLine) loadServerRecords(false);
     } else if (syncedCount > 0 && failedCount > 0) {
       showToast(`⚠️ ${syncedCount} berhasil, ${failedCount} gagal (${lastErrorMsg}).\nData yang gagal tetap aman di antrean.`, 'warning', 5500);
     } else {
@@ -1249,15 +1250,74 @@ function showToast(message, type = '', duration = 3500) {
 }
 
 // ════════════════════════════════════════════════════════════
-// RECORDS DRAWER
+// RECORDS DRAWER (PERANGKAT LOKAL & ARSIP SERVER LINTAS PERANGKAT)
 // ════════════════════════════════════════════════════════════
+
+let activeDrawerTab     = 'local'; // 'local' | 'server'
+let cachedServerRecords = [];
+let drawerAutoSelected  = false;
+
+function buildAuthHeaders(extra = {}) {
+  const headers = { ...extra };
+  const accessKey = getStoredAccessKey();
+  if (accessKey) headers['X-Access-Key'] = accessKey;
+  return headers;
+}
+
+function updateDrawerTabUI() {
+  const tabLocal  = document.getElementById('tab-local');
+  const tabServer = document.getElementById('tab-server');
+  if (tabLocal)  tabLocal.classList.toggle('active', activeDrawerTab === 'local');
+  if (tabServer) tabServer.classList.toggle('active', activeDrawerTab === 'server');
+}
+
+function setTabCount(id, count) {
+  const el = document.getElementById(id);
+  if (el) el.textContent = String(count);
+}
 
 async function openDrawer() {
   document.getElementById('drawer-overlay').classList.add('open');
   document.getElementById('records-drawer').classList.add('open');
   document.body.style.overflow = 'hidden'; // Cegah scroll body
-  const records = await getAllLaporan();
-  renderRecordsPanel(records);
+
+  const localRecords = await getAllLaporan();
+  setTabCount('count-local', localRecords.length);
+
+  // Di PC / perangkat kantor yang belum punya data lokal & sedang online, otomatis buka tab Arsip Server
+  if (!drawerAutoSelected) {
+    drawerAutoSelected = true;
+    if (localRecords.length === 0 && navigator.onLine) {
+      activeDrawerTab = 'server';
+    } else {
+      activeDrawerTab = 'local';
+    }
+  } else if (!navigator.onLine && activeDrawerTab === 'server') {
+    activeDrawerTab = 'local';
+  }
+
+  updateDrawerTabUI();
+
+  if (activeDrawerTab === 'local') {
+    renderRecordsPanel(localRecords);
+    if (navigator.onLine) {
+      loadServerRecords(false);
+    }
+  } else {
+    await loadServerRecords(true);
+  }
+}
+
+async function switchDrawerTab(tab) {
+  activeDrawerTab = tab === 'server' ? 'server' : 'local';
+  updateDrawerTabUI();
+
+  if (activeDrawerTab === 'local') {
+    const records = await getAllLaporan();
+    renderRecordsPanel(records);
+  } else {
+    await loadServerRecords(true);
+  }
 }
 
 function closeDrawer() {
@@ -1266,24 +1326,29 @@ function closeDrawer() {
   document.body.style.overflow = '';
 }
 
+function clearDrawerHeaderBtn() {
+  const oldSyncBtn = document.getElementById('drawer-sync-btn');
+  if (oldSyncBtn) oldSyncBtn.remove();
+}
+
 function renderRecordsPanel(records) {
   const container = document.getElementById('records-list');
   const headerDiv = document.querySelector('.drawer-header');
-  
+  setTabCount('count-local', records ? records.length : 0);
+
   // Periksa apakah ada record pending
   const pendingCount = records ? records.filter(r => r.status === 'pending').length : 0;
-  
-  // Hapus tombol sync lama jika ada
-  const oldSyncBtn = document.getElementById('drawer-sync-btn');
-  if (oldSyncBtn) oldSyncBtn.remove();
-  
-  if (pendingCount > 0) {
+
+  clearDrawerHeaderBtn();
+
+  if (pendingCount > 0 && activeDrawerTab === 'local') {
     const syncBtn = document.createElement('button');
     syncBtn.id = 'drawer-sync-btn';
     syncBtn.onclick = async () => {
       await syncData();
       const updatedRecords = await getAllLaporan();
       renderRecordsPanel(updatedRecords);
+      if (navigator.onLine) loadServerRecords(false);
     };
     syncBtn.innerHTML = `
       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -1310,7 +1375,7 @@ function renderRecordsPanel(records) {
           <line x1="16" y1="13" x2="8" y2="13"/>
           <line x1="16" y1="17" x2="8" y2="17"/>
         </svg>
-        <p>Belum ada data tersimpan di perangkat ini</p>
+        <p>Belum ada data lokal di perangkat ini.<br><span style="font-size:12px;">Cek tab <strong>☁️ Arsip Server</strong> untuk melihat hasil sinkronisasi dari HP/perangkat lain.</span></p>
       </div>`;
     return;
   }
@@ -1343,7 +1408,7 @@ function renderRecordsPanel(records) {
             style="display:inline-flex; align-items:center; gap:5px;
                    background:var(--primary); color:#fff; border-radius:6px;
                    padding:6px 12px; font-size:11px; font-weight:700;
-                   text-decoration:none; transition:background 0.2s;"
+                   text-decoration:none; transition:background 0.2s; white-space:nowrap;"
             onmouseover="this.style.background='#1D4ED8'"
             onmouseout="this.style.background='var(--primary)'">
            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
@@ -1361,7 +1426,7 @@ function renderRecordsPanel(records) {
             style="display:inline-flex; align-items:center; gap:5px;
                    background:#2563EB; color:#fff; border-radius:6px;
                    padding:6px 12px; font-size:11px; font-weight:700;
-                   text-decoration:none; transition:background 0.2s;"
+                   text-decoration:none; transition:background 0.2s; white-space:nowrap;"
             onmouseover="this.style.background='#1E40AF'"
             onmouseout="this.style.background='#2563EB'">
            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
@@ -1405,6 +1470,17 @@ function renderRecordsPanel(records) {
         Hapus
       </button>`;
 
+    // Tombol Sync Ulang (tampil jika record sudah synced tapi PDF/Word belum terbentuk di server)
+    const resyncBtn = (rec.status === 'synced' && (!rec.pdfUrl || !rec.docxUrl))
+      ? `<button onclick="handleResyncRecord(${rec.id})"
+                 style="display:inline-flex; align-items:center; gap:5px;
+                        background:var(--success); color:#fff; border:none; border-radius:6px;
+                        padding:6px 11px; font-size:11px; font-weight:700; cursor:pointer;
+                        white-space:nowrap;">
+           🔄 Buat PDF/Word
+         </button>`
+      : '';
+
     return `
     <div class="record-item" style="flex-direction:column; gap:6px;">
       <div style="display:flex; align-items:flex-start; gap:10px; width:100%;">
@@ -1417,13 +1493,373 @@ function renderRecordsPanel(records) {
       </div>
       <!-- Fitur Scroll Horizontal untuk Tombol -->
       <div style="display:flex; gap:8px; margin-top:6px; overflow-x:auto; padding-bottom:4px;">
-        ${editBtn}
         ${pdfBtn}
         ${docxBtn}
+        ${resyncBtn}
+        ${editBtn}
         ${deleteBtn}
       </div>
     </div>`;
   }).join('');
+}
+
+async function loadServerRecords(shouldRender = true) {
+  const container = document.getElementById('records-list');
+  if (shouldRender) {
+    clearDrawerHeaderBtn();
+    const headerDiv = document.querySelector('.drawer-header');
+    const refreshBtn = document.createElement('button');
+    refreshBtn.id = 'drawer-sync-btn';
+    refreshBtn.onclick = () => loadServerRecords(true);
+    refreshBtn.innerHTML = '↻ Segarkan';
+    refreshBtn.style = `
+      display: inline-flex; align-items: center; gap: 5px;
+      background: var(--primary-light); color: var(--primary);
+      border: 1px solid var(--primary-border); border-radius: 6px;
+      padding: 6px 10px; font-size: 11px; font-weight: 700; cursor: pointer;
+      margin-right: 10px; margin-left: auto;
+    `;
+    headerDiv.insertBefore(refreshBtn, document.querySelector('.drawer-close'));
+  }
+
+  if (!navigator.onLine) {
+    if (shouldRender && container) {
+      container.innerHTML = `
+        <div class="empty-state">
+          <p>📵 Perangkat sedang offline.<br><span style="font-size:12px;">Arsip server memerlukan koneksi internet. Data lokal tetap aman di tab <strong>📱 Perangkat Ini</strong>.</span></p>
+        </div>`;
+    }
+    return;
+  }
+
+  if (shouldRender && cachedServerRecords.length === 0 && container) {
+    container.innerHTML = `
+      <div class="empty-state">
+        <p>⏳ Mengambil daftar arsip dari server…</p>
+      </div>`;
+  } else if (shouldRender) {
+    renderServerRecordsPanel(cachedServerRecords);
+  }
+
+  try {
+    const res = await fetch('/api/server-records', {
+      method:      'GET',
+      credentials: 'same-origin',
+      headers:     buildAuthHeaders({ Accept: 'application/json' })
+    });
+
+    if (res.status === 401) {
+      if (shouldRender) {
+        closeDrawer();
+        showAuthOverlay('Masukkan Kode Akses untuk membuka Arsip Server.');
+      }
+      return;
+    }
+
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
+    const data = await res.json();
+    cachedServerRecords = Array.isArray(data.records) ? data.records : [];
+    setTabCount('count-server', cachedServerRecords.length);
+
+    if (shouldRender && activeDrawerTab === 'server') {
+      renderServerRecordsPanel(cachedServerRecords);
+    }
+  } catch (err) {
+    console.warn('[ServerRecords] Gagal memuat arsip server:', err);
+    if (shouldRender && activeDrawerTab === 'server' && container) {
+      container.innerHTML = `
+        <div class="empty-state">
+          <p>⚠️ Gagal mengambil data dari server.<br><span style="font-size:12px;">Periksa koneksi internet lalu ketuk <strong>↻ Segarkan</strong>.</span></p>
+        </div>`;
+    }
+  }
+}
+
+function renderServerRecordsPanel(records) {
+  const container = document.getElementById('records-list');
+  if (!container) return;
+
+  if (!records || records.length === 0) {
+    container.innerHTML = `
+      <div class="empty-state">
+        <svg width="44" height="44" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+          <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+          <polyline points="14 2 14 8 20 8"/>
+        </svg>
+        <p>Belum ada arsip laporan yang disinkronkan ke server.</p>
+      </div>`;
+    return;
+  }
+
+  container.innerHTML = records.map((rec) => {
+    const dt = new Date(rec.savedAt).toLocaleDateString('id-ID', {
+      day: 'numeric', month: 'short', year: 'numeric',
+      hour: '2-digit', minute: '2-digit'
+    });
+    const company   = _esc(rec.namaPerusahaan || '—');
+    const jenis     = _esc(rec.jenisObjek || '—');
+    const serie     = _esc(rec.noSerie || '—');
+    const safeSerie = _esc(rec.safeSerie);
+    const sessionTs = _esc(rec.sessionTs);
+    const blokCount = rec.bloksCount ?? 0;
+
+    const pdfBtn = rec.pdfUrl
+      ? `<a href="${_esc(rec.pdfUrl)}" target="_blank" rel="noopener"
+            style="display:inline-flex; align-items:center; gap:5px;
+                   background:var(--primary); color:#fff; border-radius:6px;
+                   padding:6px 12px; font-size:11px; font-weight:700;
+                   text-decoration:none; white-space:nowrap;">
+           <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+             <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+             <polyline points="7 10 12 15 17 10"/>
+             <line x1="12" y1="15" x2="12" y2="3"/>
+           </svg>
+           Unduh PDF
+         </a>`
+      : '';
+
+    const docxBtn = rec.docxUrl
+      ? `<a href="${_esc(rec.docxUrl)}" target="_blank" rel="noopener"
+            style="display:inline-flex; align-items:center; gap:5px;
+                   background:#2563EB; color:#fff; border-radius:6px;
+                   padding:6px 12px; font-size:11px; font-weight:700;
+                   text-decoration:none; white-space:nowrap;">
+           <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+             <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+             <polyline points="7 10 12 15 17 10"/>
+             <line x1="12" y1="15" x2="12" y2="3"/>
+           </svg>
+           Unduh Word
+         </a>`
+      : '';
+
+    const regenBtn = (!rec.pdfUrl || !rec.docxUrl)
+      ? `<button onclick="handleRegenerateServerRecord('${safeSerie}', '${sessionTs}')"
+                 style="display:inline-flex; align-items:center; gap:5px;
+                        background:var(--success); color:#fff; border:none; border-radius:6px;
+                        padding:6px 11px; font-size:11px; font-weight:700; cursor:pointer;
+                        white-space:nowrap;">
+           🔄 Buat PDF/Word
+         </button>`
+      : '';
+
+    const editBtn = `
+      <button onclick="handleEditServerRecord('${safeSerie}', '${sessionTs}')"
+              style="display:inline-flex; align-items:center; gap:5px;
+                     background:var(--primary-light); color:var(--primary); border:1px solid var(--primary-border); border-radius:6px;
+                     padding:5px 10px; font-size:11px; font-weight:700; cursor:pointer; white-space:nowrap;">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+          <path d="M12 20h9"></path>
+          <path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"></path>
+        </svg>
+        Sunting
+      </button>`;
+
+    const deleteBtn = `
+      <button onclick="handleDeleteServerRecord('${safeSerie}', '${sessionTs}')"
+              style="display:inline-flex; align-items:center; gap:5px;
+                     background:var(--danger-bg); color:var(--danger); border:1px solid var(--danger-border); border-radius:6px;
+                     padding:5px 10px; font-size:11px; font-weight:700; cursor:pointer; white-space:nowrap;">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+          <polyline points="3 6 5 6 21 6"></polyline>
+          <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path>
+        </svg>
+        Hapus
+      </button>`;
+
+    return `
+    <div class="record-item" style="flex-direction:column; gap:6px;">
+      <div style="display:flex; align-items:flex-start; gap:10px; width:100%;">
+        <div class="record-info">
+          <div class="record-company">${company}</div>
+          <div class="record-meta">${jenis} | SN: ${serie}</div>
+          <div class="record-meta">${blokCount} blok &bull; ${dt}</div>
+        </div>
+        <span class="record-badge synced">☁️ Server</span>
+      </div>
+      <div style="display:flex; gap:8px; margin-top:6px; overflow-x:auto; padding-bottom:4px;">
+        ${pdfBtn}
+        ${docxBtn}
+        ${regenBtn}
+        ${editBtn}
+        ${deleteBtn}
+      </div>
+    </div>`;
+  }).join('');
+}
+
+async function handleRegenerateServerRecord(safeSerie, sessionTs) {
+  showToast('🔄 Sedang membuat PDF & Word di server…', '', 6000);
+  try {
+    const res = await fetch(`/api/server-records/${encodeURIComponent(safeSerie)}/${encodeURIComponent(sessionTs)}/regenerate`, {
+      method:      'POST',
+      credentials: 'same-origin',
+      headers:     buildAuthHeaders({ Accept: 'application/json' })
+    });
+    const data = await res.json();
+    if (!res.ok || !data.success) {
+      throw new Error(data.pdfError || data.docxError || data.message || `HTTP ${res.status}`);
+    }
+    if (data.pdfError) {
+      showToast(`⚠️ Word siap, tetapi PDF gagal: ${data.pdfError.slice(0, 90)}`, 'warning', 5500);
+    } else {
+      showToast('✅ File PDF & Word berhasil dibuat!', 'success');
+    }
+    await loadServerRecords(true);
+  } catch (err) {
+    console.error('[ServerRegen] Error:', err);
+    showToast(`❌ Gagal membuat dokumen: ${err.message.slice(0, 100)}`, 'error', 5000);
+  }
+}
+
+async function handleEditServerRecord(safeSerie, sessionTs) {
+  showToast('⏳ Memuat foto & data laporan dari server…', '');
+  try {
+    const res = await fetch(`/api/server-records/${encodeURIComponent(safeSerie)}/${encodeURIComponent(sessionTs)}/detail`, {
+      method:      'GET',
+      credentials: 'same-origin',
+      headers:     buildAuthHeaders({ Accept: 'application/json' })
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    if (!data.record) throw new Error('Data kosong');
+
+    populateFormFromRecord(data.record, null);
+    closeDrawer();
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+    showToast('✏️ Laporan dari server berhasil dimuat ke editor!', 'success');
+  } catch (err) {
+    console.error('[ServerEdit] Error:', err);
+    showToast('Gagal memuat detail laporan dari server.', 'error');
+  }
+}
+
+async function handleDeleteServerRecord(safeSerie, sessionTs) {
+  if (!confirm('Hapus permanen arsip laporan ini beserta file PDF & Word-nya dari Server?')) return;
+  try {
+    const res = await fetch(`/api/server-records/${encodeURIComponent(safeSerie)}/${encodeURIComponent(sessionTs)}/delete`, {
+      method:      'POST',
+      credentials: 'same-origin',
+      headers:     buildAuthHeaders({ Accept: 'application/json' })
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    showToast('🗑️ Arsip berhasil dihapus dari server.', 'success');
+    await loadServerRecords(true);
+  } catch (err) {
+    console.error('[ServerDelete] Error:', err);
+    showToast('Gagal menghapus arsip dari server.', 'error');
+  }
+}
+
+async function handleResyncRecord(id) {
+  try {
+    const tx = db.transaction([STORE_NAME], 'readwrite');
+    const store = tx.objectStore(STORE_NAME);
+    const getReq = store.get(id);
+    await new Promise((resolve, reject) => {
+      getReq.onsuccess = () => {
+        const rec = getReq.result;
+        if (!rec) { resolve(); return; }
+        rec.status = 'pending';
+        const putReq = store.put(rec);
+        putReq.onsuccess = () => resolve();
+        putReq.onerror   = () => reject(putReq.error);
+      };
+      getReq.onerror = () => reject(getReq.error);
+    });
+    await refreshPendingBadge();
+    await syncData();
+    const updatedRecords = await getAllLaporan();
+    renderRecordsPanel(updatedRecords);
+    if (navigator.onLine) loadServerRecords(false);
+  } catch (err) {
+    console.error('[Resync] Error:', err);
+    showToast('Gagal membuat ulang dokumen.', 'error');
+  }
+}
+
+function populateFormFromRecord(record, localEditId) {
+  // 1. Populate Identitas
+  document.getElementById('nama-perusahaan').value = record.namaPerusahaan || '';
+  document.getElementById('jenis-objek').value     = record.jenisObjek || 'Pesawat Angkat & Angkut';
+  document.getElementById('no-serie').value        = record.noSerie || '';
+
+  // 2. Clear current blocks
+  const blockList = document.getElementById('block-list');
+  blockList.innerHTML = '';
+  blockCounter = 0;
+
+  // 3. Populate Blocks
+  if (record.blokDokumentasi && Array.isArray(record.blokDokumentasi)) {
+    record.blokDokumentasi.forEach(blok => {
+      addBlock();
+      const bId = `blk-${blockCounter}`;
+      const blockEl = document.getElementById(bId);
+      if (!blockEl) return;
+
+      const judulInput = blockEl.querySelector('.block-judul');
+      if (judulInput) judulInput.value = blok.judul || '';
+
+      const layout = blok.layout || '1col';
+      const radio = blockEl.querySelector(`input[name="layout-${bId}"][value="${layout}"]`);
+      if (radio) {
+        radio.checked = true;
+        renderSlots(bId, layout);
+      }
+
+      if (blok.slots && Array.isArray(blok.slots)) {
+        blok.slots.forEach((slotData, idx) => {
+          const slotEl  = document.getElementById(`s-${bId}-${idx}`);
+          const prevEl  = document.getElementById(`p-${bId}-${idx}`);
+          const holdEl  = document.getElementById(`h-${bId}-${idx}`);
+          const clearEl = document.getElementById(`c-${bId}-${idx}`);
+          const ketEl   = document.querySelector(`#s-${bId}-${idx} .slot-keterangan`);
+
+          if (slotEl && slotData.foto) {
+            slotEl.dataset.base64 = slotData.foto;
+            if (prevEl) {
+              prevEl.src = slotData.foto;
+              prevEl.classList.add('visible');
+            }
+            if (holdEl) holdEl.classList.add('hidden');
+            if (clearEl) clearEl.classList.remove('hidden');
+          }
+
+          if (ketEl && slotData.keterangan) {
+            ketEl.value = slotData.keterangan;
+          }
+        });
+      }
+    });
+  }
+
+  // 4. Set State & UI
+  const btnSave = document.getElementById('btn-save');
+  if (record.status === 'synced' || localEditId === null) {
+    editingId = null;
+    if (btnSave) {
+      btnSave.innerHTML = `
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+          <path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/>
+          <polyline points="17 21 17 13 7 13 7 21"/>
+          <polyline points="7 3 7 8 15 8"/>
+        </svg>
+        Simpan sbg Draf Baru
+      `;
+    }
+  } else {
+    editingId = localEditId;
+    if (btnSave) {
+      btnSave.innerHTML = `
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+          <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"></path>
+          <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"></path>
+        </svg>
+        Perbarui Draf
+      `;
+    }
+  }
 }
 
 async function handleEditRecord(id) {
@@ -1438,94 +1874,14 @@ async function handleEditRecord(id) {
         showToast('Data tidak ditemukan.', 'error');
         return;
       }
-      
-      // 1. Populate Identitas
-      document.getElementById('nama-perusahaan').value = record.namaPerusahaan || '';
-      document.getElementById('jenis-objek').value     = record.jenisObjek || 'Pesawat Angkat & Angkut';
-      document.getElementById('no-serie').value        = record.noSerie || '';
-      
-      // 2. Clear current blocks
-      const blockList = document.getElementById('block-list');
-      blockList.innerHTML = '';
-      blockCounter = 0;
-      
-      // 3. Populate Blocks
-      if (record.blokDokumentasi && Array.isArray(record.blokDokumentasi)) {
-        record.blokDokumentasi.forEach(blok => {
-           addBlock(); 
-           const bId = `blk-${blockCounter}`;
-           const blockEl = document.getElementById(bId);
-           
-           if (!blockEl) return;
 
-           const judulInput = blockEl.querySelector('.block-judul');
-           if (judulInput) judulInput.value = blok.judul || '';
-           
-           const layout = blok.layout || '1col';
-           const radio = blockEl.querySelector(`input[name="layout-${bId}"][value="${layout}"]`);
-           if (radio) {
-             radio.checked = true;
-             renderSlots(bId, layout);
-           }
-           
-           if (blok.slots && Array.isArray(blok.slots)) {
-             blok.slots.forEach((slotData, idx) => {
-               const slotEl  = document.getElementById(`s-${bId}-${idx}`);
-               const prevEl  = document.getElementById(`p-${bId}-${idx}`);
-               const holdEl  = document.getElementById(`h-${bId}-${idx}`);
-               const clearEl = document.getElementById(`c-${bId}-${idx}`);
-               const ketEl   = document.querySelector(`#s-${bId}-${idx} .slot-keterangan`);
-               
-               if (slotEl && slotData.foto) {
-                 slotEl.dataset.base64 = slotData.foto;
-                 if (prevEl) {
-                   prevEl.src = slotData.foto;
-                   prevEl.classList.add('visible');
-                 }
-                 if (holdEl) holdEl.classList.add('hidden');
-                 if (clearEl) clearEl.classList.remove('hidden');
-               }
-               
-               if (ketEl && slotData.keterangan) {
-                 ketEl.value = slotData.keterangan;
-               }
-             });
-           }
-        });
-      }
-      
-      // 4. Set State & UI
-      const btnSave = document.getElementById('btn-save');
-      
+      populateFormFromRecord(record, record.status === 'synced' ? null : id);
       if (record.status === 'synced') {
-        // Jika sudah disinkronkan, kita clone record ini sebagai draf baru
-        editingId = null;
-        if (btnSave) {
-          btnSave.innerHTML = `
-            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
-              <path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/>
-              <polyline points="17 21 17 13 7 13 7 21"/>
-              <polyline points="7 3 7 8 15 8"/>
-            </svg>
-            Simpan sbg Draf Baru
-          `;
-        }
         showToast('✏️ Mode Salin Aktif. Data akan disimpan sebagai laporan baru.', 'success');
       } else {
-        // Jika masih draf (pending), perbarui record yang sama
-        editingId = id;
-        if (btnSave) {
-          btnSave.innerHTML = `
-            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
-              <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"></path>
-              <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"></path>
-            </svg>
-            Perbarui Draf
-          `;
-        }
         showToast('✏️ Mode Penyuntingan Aktif. Silakan ubah data.', 'success');
       }
-      
+
       closeDrawer();
       window.scrollTo({ top: 0, behavior: 'smooth' });
     };
@@ -1536,10 +1892,10 @@ async function handleEditRecord(id) {
 }
 
 async function handleDeleteRecord(id) {
-  if (!confirm('Apakah Anda yakin ingin menghapus data ini dari perangkat?')) return;
+  if (!confirm('Hapus data ini dari memori perangkat ini? (Arsip yang sudah disinkronkan di Server tetap aman)')) return;
   try {
     await deleteLaporan(id);
-    showToast('Data berhasil dihapus.', 'success');
+    showToast('Data berhasil dihapus dari perangkat.', 'success');
     await refreshPendingBadge();
     const records = await getAllLaporan();
     renderRecordsPanel(records);
