@@ -373,18 +373,21 @@ function deleteLaporan(id) {
  */
 function compressImage(file) {
   return new Promise((resolve, reject) => {
-    if (!file || !file.type.startsWith('image/')) {
+    if (!file) {
+      reject(new Error('File tidak ditemukan.'));
+      return;
+    }
+
+    const isKnownExt = /\.(jpe?g|png|webp|gif|bmp|heic|heif)$/i.test(file.name || '');
+    if (file.type && !file.type.startsWith('image/') && !isKnownExt) {
       reject(new Error('File bukan gambar yang valid.'));
       return;
     }
 
     const originalKB = (file.size / 1024).toFixed(1);
-    const reader     = new FileReader();
 
-    reader.onload = (readerEvent) => {
-      const img = new Image();
-
-      img.onload = () => {
+    const processLoadedImage = (img, cleanupFn) => {
+      try {
         let { width, height } = img;
 
         // Hitung dimensi baru dengan mempertahankan rasio aspek
@@ -402,17 +405,49 @@ function compressImage(file) {
         ctx.drawImage(img, 0, 0, width, height);
 
         // Export ke Base64 JPEG
-        const base64        = canvas.toDataURL('image/jpeg', JPEG_QUALITY);
+        const base64       = canvas.toDataURL('image/jpeg', JPEG_QUALITY);
         // Estimasi ukuran: Base64 4/3 lebih besar dari binary; kurangi 33% overhead
-        const compressedKB  = Math.round((base64.length * 0.75) / 1024);
+        const compressedKB = Math.round((base64.length * 0.75) / 1024);
 
+        if (cleanupFn) cleanupFn();
         resolve({ base64, originalKB: parseFloat(originalKB), compressedKB, width, height });
-      };
-
-      img.onerror = () => reject(new Error('Gagal memuat gambar. Format tidak didukung.'));
-      img.src = readerEvent.target.result;
+      } catch (err) {
+        if (cleanupFn) cleanupFn();
+        reject(new Error('Gagal memproses gambar di perangkat.'));
+      }
     };
 
+    // Gunakan Object URL terlebih dahulu (jauh lebih hemat RAM di HP dibanding FileReader pada foto 50MP+)
+    if (typeof URL !== 'undefined' && URL.createObjectURL) {
+      const objectUrl = URL.createObjectURL(file);
+      const img       = new Image();
+      const cleanup   = () => { try { URL.revokeObjectURL(objectUrl); } catch (_) {} };
+
+      img.onload  = () => processLoadedImage(img, cleanup);
+      img.onerror = () => {
+        cleanup();
+        // Fallback ke FileReader jika Object URL gagal
+        const reader = new FileReader();
+        reader.onload = (e) => {
+          const fallbackImg = new Image();
+          fallbackImg.onload  = () => processLoadedImage(fallbackImg, null);
+          fallbackImg.onerror = () => reject(new Error('Format foto tidak didukung browser ini (gunakan JPG/PNG).'));
+          fallbackImg.src     = e.target.result;
+        };
+        reader.onerror = () => reject(new Error('Gagal membaca file dari perangkat.'));
+        reader.readAsDataURL(file);
+      };
+      img.src = objectUrl;
+      return;
+    }
+
+    const reader = new FileReader();
+    reader.onload = (readerEvent) => {
+      const img = new Image();
+      img.onload  = () => processLoadedImage(img, null);
+      img.onerror = () => reject(new Error('Gagal memuat gambar. Format tidak didukung.'));
+      img.src     = readerEvent.target.result;
+    };
     reader.onerror = () => reject(new Error('Gagal membaca file dari perangkat.'));
     reader.readAsDataURL(file);
   });
@@ -563,12 +598,13 @@ function renderSlots(bId, layout) {
  * @returns {string} HTML string
  */
 function _buildSlotHTML(bId, slotIdx, label) {
-  const sId      = `s-${bId}-${slotIdx}`;   // slot wrapper id
-  const fileId   = `f-${bId}-${slotIdx}`;   // file input id
-  const prevId   = `p-${bId}-${slotIdx}`;   // preview img id
-  const holdId   = `h-${bId}-${slotIdx}`;   // placeholder id
-  const infoId   = `i-${bId}-${slotIdx}`;   // compression info id
-  const clearId  = `c-${bId}-${slotIdx}`;   // clear button id
+  const sId     = `s-${bId}-${slotIdx}`;     // slot wrapper id
+  const camId   = `cam-${bId}-${slotIdx}`;   // input khusus kamera belakang
+  const galId   = `gal-${bId}-${slotIdx}`;   // input khusus galeri / file picker
+  const prevId  = `p-${bId}-${slotIdx}`;     // preview img id
+  const holdId  = `h-${bId}-${slotIdx}`;     // placeholder id
+  const infoId  = `i-${bId}-${slotIdx}`;     // compression info id
+  const clearId = `c-${bId}-${slotIdx}`;     // clear button id
 
   return `
   <div class="slot-item" id="${sId}" data-base64="">
@@ -580,33 +616,42 @@ function _buildSlotHTML(bId, slotIdx, label) {
       <img class="photo-preview" id="${prevId}"
            alt="Preview foto ${label}" style="object-fit:contain; height:200px; max-height:200px;">
 
-      <!-- Placeholder (klik untuk buka kamera/file) -->
-      <div class="photo-placeholder" id="${holdId}"
-           onclick="document.getElementById('${fileId}').click()"
-           role="button" tabindex="0"
-           onkeydown="if(event.key==='Enter')document.getElementById('${fileId}').click()">
+      <!-- Placeholder menggunakan native <label> agar tidak diblokir browser HP -->
+      <label class="photo-placeholder" id="${holdId}" for="${galId}">
         <svg width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
           <rect x="3" y="3" width="18" height="18" rx="2"/>
           <circle cx="8.5" cy="8.5" r="1.5"/>
           <polyline points="21 15 16 10 5 21"/>
         </svg>
-        <span>Ketuk untuk foto / pilih gambar</span>
-      </div>
+        <span>Ketuk untuk pilih gambar / foto</span>
+      </label>
 
-      <!-- File input tersembunyi (capture=environment untuk kamera belakang) -->
-      <input type="file" id="${fileId}" accept="image/*" capture="environment"
+      <!-- Input 1: Khusus Kamera Belakang -->
+      <input type="file" class="sr-file-input" id="${camId}" accept="image/*" capture="environment"
+             onchange="handleFile('${bId}',${slotIdx},this)">
+
+      <!-- Input 2: Khusus Galeri / File (tanpa atribut capture agar galeri tidak terkunci) -->
+      <input type="file" class="sr-file-input" id="${galId}" accept="image/*"
              onchange="handleFile('${bId}',${slotIdx},this)">
     </div>
 
-    <!-- Action Row -->
+    <!-- Action Row: Native <label> untuk Kamera & Galeri terpisah -->
     <div class="photo-actions" style="margin-top:8px;">
-      <button type="button" class="btn-cam" onclick="document.getElementById('${fileId}').click()">
+      <label class="btn-cam" for="${camId}">
         <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
           <path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/>
           <circle cx="12" cy="13" r="4"/>
         </svg>
-        Pilih / Ambil Foto
-      </button>
+        Kamera
+      </label>
+      <label class="btn-galeri" for="${galId}">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
+          <rect x="3" y="3" width="18" height="18" rx="2"/>
+          <circle cx="8.5" cy="8.5" r="1.5"/>
+          <polyline points="21 15 16 10 5 21"/>
+        </svg>
+        Galeri
+      </label>
       <button type="button" class="btn-clear-photo hidden" id="${clearId}"
               onclick="clearPhoto('${bId}',${slotIdx})" title="Hapus foto ini" aria-label="Hapus foto">
         <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
@@ -688,6 +733,9 @@ async function handleFile(bId, slotIdx, input) {
     console.error('[Compress] Error:', err);
     infoEl.style.color  = 'var(--danger)';
     infoEl.textContent  = `❌ Gagal: ${err.message}`;
+  } finally {
+    // Reset value agar memilih foto yang sama kembali tetap memicu event onchange
+    if (input) input.value = '';
   }
 }
 
@@ -697,12 +745,13 @@ async function handleFile(bId, slotIdx, input) {
  * @param {number} slotIdx
  */
 function clearPhoto(bId, slotIdx) {
-  const slotEl    = document.getElementById(`s-${bId}-${slotIdx}`);
-  const prevEl    = document.getElementById(`p-${bId}-${slotIdx}`);
-  const holdEl    = document.getElementById(`h-${bId}-${slotIdx}`);
-  const infoEl    = document.getElementById(`i-${bId}-${slotIdx}`);
-  const clearEl   = document.getElementById(`c-${bId}-${slotIdx}`);
-  const fileInput = document.getElementById(`f-${bId}-${slotIdx}`);
+  const slotEl   = document.getElementById(`s-${bId}-${slotIdx}`);
+  const prevEl   = document.getElementById(`p-${bId}-${slotIdx}`);
+  const holdEl   = document.getElementById(`h-${bId}-${slotIdx}`);
+  const infoEl   = document.getElementById(`i-${bId}-${slotIdx}`);
+  const clearEl  = document.getElementById(`c-${bId}-${slotIdx}`);
+  const camInput = document.getElementById(`cam-${bId}-${slotIdx}`);
+  const galInput = document.getElementById(`gal-${bId}-${slotIdx}`);
 
   slotEl.dataset.base64 = '';
   prevEl.src            = '';
@@ -711,7 +760,8 @@ function clearPhoto(bId, slotIdx) {
   clearEl.classList.add('hidden');
   infoEl.textContent    = '';
   infoEl.style.color    = '';
-  if (fileInput) fileInput.value = '';
+  if (camInput) camInput.value = '';
+  if (galInput) galInput.value = '';
 }
 
 // ════════════════════════════════════════════════════════════
@@ -1384,8 +1434,21 @@ function applyUpdate() {
 // INITIALIZATION
 // ════════════════════════════════════════════════════════════
 
+function detectInAppWebView() {
+  const ua = navigator.userAgent || '';
+  const isInApp = /WhatsApp|Instagram|FBAN|FBAV|Line\/|Telegram/i.test(ua) ||
+                  (/wv\)/.test(ua) && /Version\/\d/.test(ua));
+  if (isInApp) {
+    const banner = document.getElementById('webview-banner');
+    if (banner) banner.classList.remove('hidden');
+  }
+}
+
 document.addEventListener('DOMContentLoaded', async () => {
   console.log('[App] Initializing Riksa Uji PJK3 PWA…');
+
+  // 0. Deteksi jika dibuka di browser internal aplikasi chat (WhatsApp/IG)
+  detectInAppWebView();
 
   // 1. Daftarkan Service Worker
   registerServiceWorker();

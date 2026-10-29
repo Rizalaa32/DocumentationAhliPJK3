@@ -2,12 +2,12 @@
 // Strategi: Cache-First untuk asset UI, bypass untuk API calls & uploads
 'use strict';
 
-const CACHE_NAME = 'riksauji-v16';
+const CACHE_NAME = 'riksauji-v17';
 const STATIC_ASSETS = [
   '/',
   '/index.html',
   '/app.js',
-  '/app.js?v=16',
+  '/app.js?v=17',
   '/manifest.json',
   '/icons/icon-192.png',
   '/icons/icon-512.png'
