@@ -1433,7 +1433,7 @@ function renderRecordsPanel(records) {
 
     // Tombol download Word (hanya tampil untuk record synced yang punya docxUrl)
     const docxBtn = (rec.status === 'synced' && rec.docxUrl)
-      ? `<a href="${_esc(rec.docxUrl)}" target="_blank" rel="noopener"
+      ? `<a href="${_esc(rec.docxUrl)}" download
             style="display:inline-flex; align-items:center; gap:5px;
                    background:#2563EB; color:#fff; border-radius:6px;
                    padding:6px 12px; font-size:11px; font-weight:700;
@@ -1632,7 +1632,7 @@ function renderServerRecordsPanel(records) {
       : '';
 
     const docxBtn = rec.docxUrl
-      ? `<a href="${_esc(rec.docxUrl)}" target="_blank" rel="noopener"
+      ? `<a href="${_esc(rec.docxUrl)}" download
             style="display:inline-flex; align-items:center; gap:5px;
                    background:#2563EB; color:#fff; border-radius:6px;
                    padding:6px 12px; font-size:11px; font-weight:700;
@@ -1646,15 +1646,16 @@ function renderServerRecordsPanel(records) {
          </a>`
       : '';
 
-    const regenBtn = (!rec.pdfUrl || !rec.docxUrl)
-      ? `<button onclick="handleRegenerateServerRecord('${safeSerie}', '${sessionTs}')"
+    const isMissingDocs = !rec.pdfUrl || !rec.docxUrl;
+    const regenBtn = `<button type="button" onclick="handleRegenerateServerRecord('${safeSerie}', '${sessionTs}')"
                  style="display:inline-flex; align-items:center; gap:5px;
-                        background:var(--success); color:#fff; border:none; border-radius:6px;
-                        padding:6px 11px; font-size:11px; font-weight:700; cursor:pointer;
-                        white-space:nowrap;">
-           🔄 Buat PDF/Word
-         </button>`
-      : '';
+                        background:${isMissingDocs ? 'var(--success)' : '#ECFDF5'};
+                        color:${isMissingDocs ? '#fff' : '#047857'};
+                        border:${isMissingDocs ? 'none' : '1px solid #A7F3D0'};
+                        border-radius:6px; padding:5px 10px; font-size:11px; font-weight:700;
+                        cursor:pointer; white-space:nowrap;">
+           ${isMissingDocs ? '🔄 Buat PDF/Word' : '↻ Buat Ulang'}
+         </button>`;
 
     const editBtn = `
       <button onclick="handleEditServerRecord('${safeSerie}', '${sessionTs}')"

@@ -8,7 +8,7 @@ const crypto     = require('crypto');
 const path       = require('path');
 const fs         = require('fs');
 const puppeteer  = require('puppeteer');
-const htmlDocx   = require('html-docx-js');
+const JSZip      = require('jszip');
 const { Jimp }   = require('jimp');
 
 // Muat konfigurasi dari file .env jika tersedia (tanpa dependency tambahan)
@@ -149,11 +149,44 @@ app.use((req, res, next) => {
 app.use(express.static(PUBLIC_DIR));
 
 // Expose folder gambar & dokumen yang tersimpan (dilindungi ACCESS_KEY jika aktif)
-app.use('/uploads', (req, res, next) => {
+app.use('/uploads', async (req, res, next) => {
   if (!isAuthorized(req)) {
     return res.status(401).send('401 Unauthorized — Buka aplikasi melalui tautan resmi terlebih dahulu.');
   }
   setAuthCookie(req, res);
+  res.setHeader('Cache-Control', 'private, no-cache, no-store, must-revalidate');
+
+  if (req.method === 'GET' && /\.docx$/i.test(req.path)) {
+    const fname = path.basename(req.path).replace(/[^a-zA-Z0-9._-]/g, '_');
+    res.setHeader('Content-Disposition', `attachment; filename="${fname}"`);
+
+    // Auto-upgrade file .docx lama berbasis MHTML (afchunk.mht) menjadi Native OpenXML
+    // agar laporan lama langsung bisa dibuka di HP tanpa perlu upload ulang.
+    const match = req.path.match(/^\/([^/]+)\/(\d+)\/([^/]+\.docx)$/i);
+    if (match) {
+      try {
+        const resolved = resolveSafeSessionDir(decodeURIComponent(match[1]), match[2]);
+        if (resolved) {
+          const docxAbs = path.resolve(resolved.sessionDir, decodeURIComponent(match[3]));
+          if (docxAbs.startsWith(resolved.sessionDir + path.sep) && fs.existsSync(docxAbs)) {
+            const rawBuf = fs.readFileSync(docxAbs);
+            if (rawBuf.includes('afchunk.mht')) {
+              const { docMeta, docxBlocks } = buildSessionDocxData(
+                resolved.safeSerie,
+                resolved.sessionTs,
+                getBaseUrl(req)
+              );
+              await generateDocx(docMeta, docxBlocks, docxAbs);
+              console.log(`[DOCX] Auto-upgraded legacy MHTML docx -> Native OpenXML: ${docxAbs}`);
+            }
+          }
+        }
+      } catch (upgradeErr) {
+        console.warn('[DOCX] Auto-upgrade warning:', upgradeErr.message);
+      }
+    }
+  }
+
   next();
 }, express.static(UPLOADS));
 
@@ -378,7 +411,7 @@ function generateBase6Grid(blok, imagePaths, baseUrl) {
         }
       }
     }
-    const ket = esc(slot.keterangan || '\u2014');
+    const ket = esc(slot.keterangan || '\u2014').replace(/\r?\n/g, '<br>');
 
     let maxW = 285;
     let maxH = 340;
@@ -509,30 +542,422 @@ async function generatePDF(htmlContent, outputPath) {
   }
 }
 
+// ════════════════════════════════════════════════════════════
+// NATIVE OPENXML (.DOCX) GENERATION (KOMPATIBEL PC & MOBILE)
+// ════════════════════════════════════════════════════════════
+
 /**
- * Menghasilkan file Word (.docx) dari string HTML menggunakan html-to-docx.
- * 
- * @param {string} htmlContent  - String HTML lengkap yang akan dirender
- * @param {string} outputPath   - Absolute path file Docx tujuan
- * @returns {Promise<string>}   - Path file Docx yang tersimpan
+ * Escape teks untuk XML 1.0 (hapus control char ilegal & escape entitas XML).
+ * @param {string} str
+ * @returns {string}
  */
-async function generateDocx(htmlContent, outputPath) {
+function xmlEsc(str) {
+  return String(str == null ? '' : str)
+    .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F]/g, '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;');
+}
+
+/**
+ * Membangun elemen <w:r> WordprocessingML dengan dukungan multi-baris (\n -> <w:br/>).
+ * @param {string} str
+ * @param {string} rPrInnerXml
+ * @returns {string}
+ */
+function buildWordRun(str, rPrInnerXml = '') {
+  const lines = String(str == null ? '' : str).split(/\r?\n/);
+  const textXml = lines
+    .map((line, i) => `${i > 0 ? '<w:br/>' : ''}<w:t xml:space="preserve">${xmlEsc(line)}</w:t>`)
+    .join('');
+  return `<w:r>${rPrInnerXml ? `<w:rPr>${rPrInnerXml}</w:rPr>` : ''}${textXml}</w:r>`;
+}
+
+/**
+ * Menghasilkan file Microsoft Word (.docx) standar Native ECMA-376 OpenXML.
+ * Tidak menggunakan MHTML/<w:altChunk> sehingga 100% terbaca penuh di:
+ *   - Microsoft Word Desktop (Windows / macOS)
+ *   - WPS Office, Microsoft Word Mobile, Google Docs, Mi Doc Viewer (Android / iOS)
+ *
+ * @param {{namaPerusahaan?: string, jenisObjek?: string, noSerie?: string}} recordMeta
+ * @param {Array<{judul?: string, layout?: string, slots?: Array<{keterangan?: string, relPath?: string|null, width?: number, height?: number}>}>} docBlocks
+ * @param {string} outputPath - Absolute path file .docx tujuan
+ * @returns {Promise<string>}
+ */
+async function generateDocx(recordMeta, docBlocks, outputPath) {
   try {
-    const out = htmlDocx.asBlob(htmlContent);
-    let buf;
-    if (Buffer.isBuffer(out)) {
-      buf = out;
-    } else if (out && typeof out.arrayBuffer === 'function') {
-      const arrayBuffer = await out.arrayBuffer();
-      buf = Buffer.from(arrayBuffer);
-    } else {
-      buf = Buffer.from(out);
-    }
-    fs.writeFileSync(outputPath, buf);
-    console.log('[DOCX] Generated:', outputPath);
+    const zip         = new JSZip();
+    const uploadsRoot = path.resolve(UPLOADS);
+    /** @type {Array<{rId: string, target: string}>} */
+    const mediaRels   = [];
+    let imgCounter    = 0;
+
+    const EMU_PER_DXA = 635; // 914400 EMU/inch ÷ 1440 dxa/inch = 635 EMU/dxa
+    const idRunProps  = '<w:rFonts w:ascii="Arial" w:hAnsi="Arial" w:cs="Arial"/><w:color w:val="0F172A"/><w:sz w:val="20"/><w:szCs w:val="20"/>';
+
+    const buildIdentityRow = (label, value) => `
+      <w:tr>
+        <w:tc>
+          <w:tcPr><w:tcW w:w="2400" w:type="dxa"/><w:vAlign w:val="top"/></w:tcPr>
+          <w:p>
+            <w:pPr><w:spacing w:before="20" w:after="20" w:line="240" w:lineRule="auto"/></w:pPr>
+            ${buildWordRun(label, idRunProps)}
+          </w:p>
+        </w:tc>
+        <w:tc>
+          <w:tcPr><w:tcW w:w="240" w:type="dxa"/><w:vAlign w:val="top"/></w:tcPr>
+          <w:p>
+            <w:pPr><w:spacing w:before="20" w:after="20" w:line="240" w:lineRule="auto"/></w:pPr>
+            ${buildWordRun(':', idRunProps)}
+          </w:p>
+        </w:tc>
+        <w:tc>
+          <w:tcPr><w:tcW w:w="7566" w:type="dxa"/><w:vAlign w:val="top"/></w:tcPr>
+          <w:p>
+            <w:pPr><w:spacing w:before="20" w:after="20" w:line="240" w:lineRule="auto"/></w:pPr>
+            ${buildWordRun(value || '\u2014', idRunProps)}
+          </w:p>
+        </w:tc>
+      </w:tr>`;
+
+    const blockTablesXml = (docBlocks || []).map((blok, bIdx) => {
+      const layout    = (blok.layout === '2col' || blok.layout === '3col') ? blok.layout : '1col';
+      const colspan   = COLSPAN_MAP[layout] || 6;
+      const slotCount = layout === '3col' ? 3 : layout === '2col' ? 2 : 1;
+      const cellW     = colspan * 1701; // 6 * 1701 = 10206 dxa (lebar cetak A4 margin 15mm)
+
+      const rawSlots  = Array.isArray(blok.slots) ? blok.slots.slice(0, slotCount) : [];
+      while (rawSlots.length < slotCount) {
+        rawSlots.push({ keterangan: '', relPath: null, width: 0, height: 0 });
+      }
+
+      const cellsXml = rawSlots.map((slot) => {
+        let photoParaXml = '';
+
+        if (slot && slot.relPath) {
+          const absImg = path.resolve(UPLOADS, slot.relPath);
+          if (absImg.startsWith(uploadsRoot + path.sep) && fs.existsSync(absImg)) {
+            const imgBuf = fs.readFileSync(absImg);
+            const isPng  = imgBuf.length >= 8 &&
+                           imgBuf[0] === 0x89 && imgBuf[1] === 0x50 &&
+                           imgBuf[2] === 0x4E && imgBuf[3] === 0x47;
+            const ext    = isPng ? 'png' : 'jpg';
+
+            let actualW  = Number(slot.width)  || 0;
+            let actualH  = Number(slot.height) || 0;
+            if (!actualW || !actualH) {
+              const detected = readImageDimensions(imgBuf);
+              actualW = detected.width;
+              actualH = detected.height;
+            }
+            if (!actualW || !actualH) {
+              actualW = 800;
+              actualH = 600;
+            }
+
+            let maxW = 4560;
+            let maxH = 5000;
+            if (layout === '1col') { maxW = 8000; maxH = 5800; }
+            if (layout === '3col') { maxW = 2920; maxH = 3600; }
+
+            const ratio = Math.min(maxW / actualW, maxH / actualH);
+            const wDxa  = Math.max(200, Math.round(actualW * ratio));
+            const hDxa  = Math.max(200, Math.round(actualH * ratio));
+            const cx    = wDxa * EMU_PER_DXA;
+            const cy    = hDxa * EMU_PER_DXA;
+
+            imgCounter++;
+            const rId       = `rIdImg${imgCounter}`;
+            const mediaName = `image_${imgCounter}.${ext}`;
+
+            zip.file(`word/media/${mediaName}`, imgBuf, { binary: true, compression: 'STORE' });
+            mediaRels.push({ rId, target: `media/${mediaName}` });
+
+            photoParaXml = `
+            <w:p>
+              <w:pPr>
+                <w:spacing w:before="40" w:after="120" w:line="240" w:lineRule="auto"/>
+                <w:jc w:val="center"/>
+              </w:pPr>
+              <w:r>
+                <w:rPr><w:noProof/></w:rPr>
+                <w:drawing>
+                  <wp:inline distT="0" distB="0" distL="0" distR="0">
+                    <wp:extent cx="${cx}" cy="${cy}"/>
+                    <wp:effectExtent l="0" t="0" r="0" b="0"/>
+                    <wp:docPr id="${imgCounter}" name="Foto ${imgCounter}" descr="Foto Dokumentasi"/>
+                    <wp:cNvGraphicFramePr>
+                      <a:graphicFrameLocks xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" noChangeAspect="1"/>
+                    </wp:cNvGraphicFramePr>
+                    <a:graphic xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+                      <a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture">
+                        <pic:pic xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture">
+                          <pic:nvPicPr>
+                            <pic:cNvPr id="${imgCounter}" name="${mediaName}" descr="Foto Dokumentasi"/>
+                            <pic:cNvPicPr>
+                              <a:picLocks noChangeAspect="1" noChangeArrowheads="1"/>
+                            </pic:cNvPicPr>
+                          </pic:nvPicPr>
+                          <pic:blipFill>
+                            <a:blip r:embed="${rId}"/>
+                            <a:stretch><a:fillRect/></a:stretch>
+                          </pic:blipFill>
+                          <pic:spPr bwMode="auto">
+                            <a:xfrm>
+                              <a:off x="0" y="0"/>
+                              <a:ext cx="${cx}" cy="${cy}"/>
+                            </a:xfrm>
+                            <a:prstGeom prst="rect"><a:avLst/></a:prstGeom>
+                          </pic:spPr>
+                        </pic:pic>
+                      </a:graphicData>
+                    </a:graphic>
+                  </wp:inline>
+                </w:drawing>
+              </w:r>
+            </w:p>`;
+          }
+        }
+
+        if (!photoParaXml) {
+          photoParaXml = `
+            <w:p>
+              <w:pPr>
+                <w:spacing w:before="240" w:after="240" w:line="240" w:lineRule="auto"/>
+                <w:jc w:val="center"/>
+              </w:pPr>
+              ${buildWordRun('[Tidak ada foto]', '<w:rFonts w:ascii="Arial" w:hAnsi="Arial" w:cs="Arial"/><w:i/><w:color w:val="94A3B8"/><w:sz w:val="18"/><w:szCs w:val="18"/>')}
+            </w:p>`;
+        }
+
+        const captionText = (slot && slot.keterangan) ? slot.keterangan : '\u2014';
+        const captionParaXml = `
+            <w:p>
+              <w:pPr>
+                <w:pBdr>
+                  <w:top w:val="single" w:sz="4" w:space="4" w:color="E2E8F0"/>
+                  <w:left w:val="single" w:sz="4" w:space="6" w:color="E2E8F0"/>
+                  <w:bottom w:val="single" w:sz="4" w:space="4" w:color="E2E8F0"/>
+                  <w:right w:val="single" w:sz="4" w:space="6" w:color="E2E8F0"/>
+                </w:pBdr>
+                <w:shd w:val="clear" w:color="auto" w:fill="F8FAFC"/>
+                <w:spacing w:before="0" w:after="20" w:line="276" w:lineRule="auto"/>
+                <w:jc w:val="left"/>
+              </w:pPr>
+              ${buildWordRun(captionText, '<w:rFonts w:ascii="Arial" w:hAnsi="Arial" w:cs="Arial"/><w:color w:val="1E293B"/><w:sz w:val="19"/><w:szCs w:val="19"/>')}
+            </w:p>`;
+
+        return `
+          <w:tc>
+            <w:tcPr>
+              <w:tcW w:w="${cellW}" w:type="dxa"/>
+              ${colspan > 1 ? `<w:gridSpan w:val="${colspan}"/>` : ''}
+              <w:vAlign w:val="top"/>
+            </w:tcPr>
+            ${photoParaXml}
+            ${captionParaXml}
+          </w:tc>`;
+      }).join('');
+
+      const blockTitle = blok.judul || `Pemeriksaan ${bIdx + 1}`;
+
+      return `
+      <w:tbl>
+        <w:tblPr>
+          <w:tblW w:w="10206" w:type="dxa"/>
+          <w:tblBorders>
+            <w:top w:val="single" w:sz="6" w:space="0" w:color="CBD5E1"/>
+            <w:left w:val="single" w:sz="6" w:space="0" w:color="CBD5E1"/>
+            <w:bottom w:val="single" w:sz="6" w:space="0" w:color="CBD5E1"/>
+            <w:right w:val="single" w:sz="6" w:space="0" w:color="CBD5E1"/>
+            <w:insideH w:val="single" w:sz="6" w:space="0" w:color="CBD5E1"/>
+            <w:insideV w:val="single" w:sz="6" w:space="0" w:color="CBD5E1"/>
+          </w:tblBorders>
+          <w:tblLayout w:type="fixed"/>
+          <w:tblCellMar>
+            <w:top w:w="140" w:type="dxa"/>
+            <w:left w:w="140" w:type="dxa"/>
+            <w:bottom w:w="140" w:type="dxa"/>
+            <w:right w:w="140" w:type="dxa"/>
+          </w:tblCellMar>
+        </w:tblPr>
+        <w:tblGrid>
+          <w:gridCol w:w="1701"/>
+          <w:gridCol w:w="1701"/>
+          <w:gridCol w:w="1701"/>
+          <w:gridCol w:w="1701"/>
+          <w:gridCol w:w="1701"/>
+          <w:gridCol w:w="1701"/>
+        </w:tblGrid>
+        <w:tr>
+          <w:trPr><w:cantSplit/></w:trPr>
+          <w:tc>
+            <w:tcPr>
+              <w:tcW w:w="10206" w:type="dxa"/>
+              <w:gridSpan w:val="6"/>
+              <w:shd w:val="clear" w:color="auto" w:fill="1E3A5F"/>
+              <w:tcMar>
+                <w:top w:w="120" w:type="dxa"/>
+                <w:left w:w="180" w:type="dxa"/>
+                <w:bottom w:w="120" w:type="dxa"/>
+                <w:right w:w="180" w:type="dxa"/>
+              </w:tcMar>
+              <w:vAlign w:val="center"/>
+            </w:tcPr>
+            <w:p>
+              <w:pPr>
+                <w:keepNext/>
+                <w:keepLines/>
+                <w:spacing w:before="0" w:after="0" w:line="240" w:lineRule="auto"/>
+                <w:jc w:val="left"/>
+              </w:pPr>
+              ${buildWordRun(blockTitle, '<w:rFonts w:ascii="Arial" w:hAnsi="Arial" w:cs="Arial"/><w:b/><w:bCs/><w:color w:val="FFFFFF"/><w:sz w:val="20"/><w:szCs w:val="20"/>')}
+            </w:p>
+          </w:tc>
+        </w:tr>
+        <w:tr>
+          <w:trPr><w:cantSplit/></w:trPr>
+          ${cellsXml}
+        </w:tr>
+      </w:tbl>
+      <w:p>
+        <w:pPr><w:spacing w:before="0" w:after="160" w:line="120" w:lineRule="auto"/></w:pPr>
+      </w:p>`;
+    }).join('');
+
+    const contentTypesXml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Default Extension="jpg" ContentType="image/jpeg"/>
+  <Default Extension="jpeg" ContentType="image/jpeg"/>
+  <Default Extension="png" ContentType="image/png"/>
+  <Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
+  <Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/>
+</Types>`;
+
+    const rootRelsXml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>
+</Relationships>`;
+
+    const docRelsXml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rIdStyles" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>
+${mediaRels.map(r => `  <Relationship Id="${r.rId}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="${r.target}"/>`).join('\n')}
+</Relationships>`;
+
+    const stylesXml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:docDefaults>
+    <w:rPrDefault>
+      <w:rPr>
+        <w:rFonts w:ascii="Arial" w:hAnsi="Arial" w:cs="Arial"/>
+        <w:color w:val="0F172A"/>
+        <w:sz w:val="20"/>
+        <w:szCs w:val="20"/>
+        <w:lang w:val="id-ID" w:eastAsia="id-ID" w:bidi="ar-SA"/>
+      </w:rPr>
+    </w:rPrDefault>
+    <w:pPrDefault>
+      <w:pPr>
+        <w:spacing w:before="0" w:after="0" w:line="240" w:lineRule="auto"/>
+      </w:pPr>
+    </w:pPrDefault>
+  </w:docDefaults>
+  <w:style w:type="paragraph" w:default="1" w:styleId="Normal">
+    <w:name w:val="Normal"/>
+    <w:qFormat/>
+  </w:style>
+  <w:style w:type="table" w:default="1" w:styleId="TableNormal">
+    <w:name w:val="Normal Table"/>
+    <w:tblPr>
+      <w:tblInd w:w="0" w:type="dxa"/>
+      <w:tblCellMar>
+        <w:top w:w="0" w:type="dxa"/>
+        <w:left w:w="108" w:type="dxa"/>
+        <w:bottom w:w="0" w:type="dxa"/>
+        <w:right w:w="108" w:type="dxa"/>
+      </w:tblCellMar>
+    </w:tblPr>
+  </w:style>
+</w:styles>`;
+
+    const documentXml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document
+  xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+  xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+  xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"
+  xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
+  xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture">
+  <w:body>
+    <w:p>
+      <w:pPr>
+        <w:spacing w:before="0" w:after="280" w:line="240" w:lineRule="auto"/>
+        <w:jc w:val="center"/>
+      </w:pPr>
+      ${buildWordRun('LAMPIRAN', '<w:rFonts w:ascii="Arial" w:hAnsi="Arial" w:cs="Arial"/><w:b/><w:bCs/><w:color w:val="0F172A"/><w:spacing w:val="15"/><w:sz w:val="24"/><w:szCs w:val="24"/>')}
+    </w:p>
+    <w:tbl>
+      <w:tblPr>
+        <w:tblW w:w="10206" w:type="dxa"/>
+        <w:tblBorders>
+          <w:top w:val="none" w:sz="0" w:space="0" w:color="auto"/>
+          <w:left w:val="none" w:sz="0" w:space="0" w:color="auto"/>
+          <w:bottom w:val="none" w:sz="0" w:space="0" w:color="auto"/>
+          <w:right w:val="none" w:sz="0" w:space="0" w:color="auto"/>
+          <w:insideH w:val="none" w:sz="0" w:space="0" w:color="auto"/>
+          <w:insideV w:val="none" w:sz="0" w:space="0" w:color="auto"/>
+        </w:tblBorders>
+        <w:tblLayout w:type="fixed"/>
+        <w:tblCellMar>
+          <w:top w:w="20" w:type="dxa"/>
+          <w:left w:w="0" w:type="dxa"/>
+          <w:bottom w:w="20" w:type="dxa"/>
+          <w:right w:w="40" w:type="dxa"/>
+        </w:tblCellMar>
+      </w:tblPr>
+      <w:tblGrid>
+        <w:gridCol w:w="2400"/>
+        <w:gridCol w:w="240"/>
+        <w:gridCol w:w="7566"/>
+      </w:tblGrid>
+      ${buildIdentityRow('Nama Perusahaan', (recordMeta && recordMeta.namaPerusahaan) || '')}
+      ${buildIdentityRow('Jenis Objek K3', (recordMeta && recordMeta.jenisObjek) || '')}
+      ${buildIdentityRow('No. Serie', (recordMeta && recordMeta.noSerie) || '')}
+    </w:tbl>
+    <w:p>
+      <w:pPr><w:spacing w:before="0" w:after="160" w:line="120" w:lineRule="auto"/></w:pPr>
+    </w:p>
+    ${blockTablesXml}
+    <w:sectPr>
+      <w:pgSz w:w="11906" w:h="16838"/>
+      <w:pgMar w:top="850" w:right="850" w:bottom="850" w:left="850" w:header="708" w:footer="708" w:gutter="0"/>
+      <w:cols w:space="708"/>
+      <w:docGrid w:linePitch="360"/>
+    </w:sectPr>
+  </w:body>
+</w:document>`;
+
+    zip.file('[Content_Types].xml', contentTypesXml);
+    zip.file('_rels/.rels', rootRelsXml);
+    zip.file('word/_rels/document.xml.rels', docRelsXml);
+    zip.file('word/styles.xml', stylesXml);
+    zip.file('word/document.xml', documentXml);
+
+    const outBuf = await zip.generateAsync({
+      type:               'nodebuffer',
+      compression:        'DEFLATE',
+      compressionOptions: { level: 6 }
+    });
+
+    fs.writeFileSync(outputPath, outBuf);
+    console.log('[DOCX] Generated Native OpenXML:', outputPath);
     return outputPath;
   } catch (err) {
-    console.error('[DOCX] Error generating docx:', err);
+    console.error('[DOCX] Error generating native docx:', err);
     throw err;
   }
 }
@@ -714,21 +1139,29 @@ function readServerSessionSummary(safeSerie, sessionTs, baseUrl) {
 
   let fallbackCompany = `Laporan (SN: ${safeSerie})`;
   let fallbackJenis   = 'Dokumentasi Riksa Uji';
-  if (!meta && docxFile) {
-    try {
-      const raw = fs.readFileSync(path.join(sessionDir, docxFile)).toString('utf8');
-      const m = raw.match(/<title>Lampiran Riksa Uji\s*(?:—|&mdash;)\s*([^<]+?)\s*(?:—|&mdash;)\s*([^<]+?)<\/title>/);
-      if (m) {
-        fallbackJenis   = m[1].trim();
-        fallbackCompany = m[2].trim();
-      }
-    } catch (_) {}
+  if (!meta) {
+    const htmlSourcePath = path.join(sessionDir, 'laporan_source.html');
+    const candidateFile  = fs.existsSync(htmlSourcePath)
+      ? htmlSourcePath
+      : (docxFile ? path.join(sessionDir, docxFile) : null);
+    if (candidateFile) {
+      try {
+        const raw = fs.readFileSync(candidateFile).toString('utf8');
+        const m = raw.match(/<title>Lampiran Riksa Uji\s*(?:—|&mdash;)\s*([^<]+?)\s*(?:—|&mdash;)\s*([^<]+?)<\/title>/);
+        if (m) {
+          fallbackJenis   = m[1].trim();
+          fallbackCompany = m[2].trim();
+        }
+      } catch (_) {}
+    }
   }
 
-  const pdfRel  = pdfFile  ? `${safeSerie}/${sessionTs}/${pdfFile}`  : null;
-  const docxRel = docxFile ? `${safeSerie}/${sessionTs}/${docxFile}` : null;
-  const tsNum   = parseInt(sessionTs, 10);
-  const savedAt = (meta && meta.savedAt)
+  const pdfRel    = pdfFile  ? `${safeSerie}/${sessionTs}/${pdfFile}`  : null;
+  const docxRel   = docxFile ? `${safeSerie}/${sessionTs}/${docxFile}` : null;
+  const pdfMtime  = pdfFile  ? Math.floor(fs.statSync(path.join(sessionDir, pdfFile)).mtimeMs)  : 0;
+  const docxMtime = docxFile ? Math.floor(fs.statSync(path.join(sessionDir, docxFile)).mtimeMs) : 0;
+  const tsNum     = parseInt(sessionTs, 10);
+  const savedAt   = (meta && meta.savedAt)
     || (!isNaN(tsNum) ? new Date(tsNum).toISOString() : fs.statSync(sessionDir).mtime.toISOString());
 
   return {
@@ -740,10 +1173,77 @@ function readServerSessionSummary(safeSerie, sessionTs, baseUrl) {
     noSerie:        (meta && meta.noSerie)        || safeSerie,
     bloksCount:     (meta && typeof meta.bloksCount === 'number') ? meta.bloksCount : blokDirs.length,
     savedAt,
-    pdfUrl:         pdfRel  ? `${baseUrl}/uploads/${pdfRel}`  : null,
-    docxUrl:        docxRel ? `${baseUrl}/uploads/${docxRel}` : null,
+    pdfUrl:         pdfRel  ? `${baseUrl}/uploads/${pdfRel}?v=${pdfMtime}`   : null,
+    docxUrl:        docxRel ? `${baseUrl}/uploads/${docxRel}?v=${docxMtime}` : null,
     hasMeta:        Boolean(meta)
   };
+}
+
+/**
+ * Menyusun data terstruktur (meta & blok dokumentasi) untuk regenerasi PDF & Native Word (.docx)
+ * dari folder sesi di server (baik yang memiliki meta.json maupun arsip lama).
+ */
+function buildSessionDocxData(safeSerie, sessionTs, baseUrl) {
+  const sessionDir = path.join(UPLOADS, safeSerie, sessionTs);
+  const metaPath   = path.join(sessionDir, 'meta.json');
+  let meta         = null;
+
+  if (fs.existsSync(metaPath)) {
+    try { meta = JSON.parse(fs.readFileSync(metaPath, 'utf8')); } catch (_) {}
+  }
+
+  if (meta && Array.isArray(meta.bloks)) {
+    const docMeta = {
+      namaPerusahaan: meta.namaPerusahaan || '',
+      jenisObjek:     meta.jenisObjek     || '',
+      noSerie:        meta.noSerie        || safeSerie
+    };
+    const docxBlocks = meta.bloks.map((b, idx) => ({
+      judul:  b.judul  || `Pemeriksaan ${idx + 1}`,
+      layout: b.layout || '1col',
+      slots:  (b.slots || []).map(s => ({
+        keterangan: s.keterangan   || '',
+        relPath:    s.imageRelPath || null,
+        width:      s.width        || 0,
+        height:     s.height       || 0
+      }))
+    }));
+    return { meta, docMeta, docxBlocks };
+  }
+
+  const summary = readServerSessionSummary(safeSerie, sessionTs, baseUrl) || {
+    namaPerusahaan: `Laporan (SN: ${safeSerie})`,
+    jenisObjek:     'Dokumentasi Riksa Uji',
+    noSerie:        safeSerie
+  };
+  const docMeta = {
+    namaPerusahaan: summary.namaPerusahaan,
+    jenisObjek:     summary.jenisObjek,
+    noSerie:        summary.noSerie
+  };
+
+  const blokDirs = fs.readdirSync(sessionDir)
+    .filter(f => /^blok_\d+$/i.test(f) && fs.statSync(path.join(sessionDir, f)).isDirectory())
+    .sort((a, b) => parseInt(a.split('_')[1], 10) - parseInt(b.split('_')[1], 10));
+
+  const docxBlocks = blokDirs.map((bDir, idx) => {
+    const bPath  = path.join(sessionDir, bDir);
+    const imgs   = fs.readdirSync(bPath).filter(f => /\.(jpg|jpeg|png)$/i.test(f)).sort();
+    const layout = imgs.length >= 3 ? '3col' : imgs.length === 2 ? '2col' : '1col';
+    const slots  = imgs.map(f => ({
+      keterangan: '',
+      relPath:    `${safeSerie}/${sessionTs}/${bDir}/${f}`,
+      width:      0,
+      height:     0
+    }));
+    return {
+      judul: `Pemeriksaan ${idx + 1}`,
+      layout,
+      slots
+    };
+  });
+
+  return { meta: null, docMeta, docxBlocks };
 }
 
 app.post('/api/sync', requireAccessKey, async (req, res) => {
@@ -843,14 +1343,29 @@ app.post('/api/sync', requireAccessKey, async (req, res) => {
         console.warn(`[PDF] ✗ Generation failed for record ${rIdx + 1}:`, genErr.message);
       }
 
-      // ── Generate Word (Docx) ──
+      // ── Generate Word (Docx Native OpenXML) ──
       let docxUrl  = null;
       let docxPath = null;
       const docxFilename = `laporan_${safeSerie}_${sessionTs}.docx`;
       const docxAbsPath  = path.join(recordDir, docxFilename);
+      const docxBlocks   = (record.blokDokumentasi || []).map((b, bIdx) => ({
+        judul:  b.judul  || `Pemeriksaan ${bIdx + 1}`,
+        layout: b.layout || '1col',
+        slots:  (b.slots || []).map((s, sIdx) => {
+          const imgInfo = processedBlocks[bIdx] && processedBlocks[bIdx].imagePaths
+            ? processedBlocks[bIdx].imagePaths[sIdx]
+            : null;
+          return {
+            keterangan: s.keterangan || '',
+            relPath:    imgInfo ? imgInfo.relPath : null,
+            width:      imgInfo ? imgInfo.width   : 0,
+            height:     imgInfo ? imgInfo.height  : 0
+          };
+        })
+      }));
       
       try {
-        await generateDocx(fullHtmlDoc, docxAbsPath);
+        await generateDocx(record, docxBlocks, docxAbsPath);
         const docxRel = path.join(safeSerie, String(sessionTs), docxFilename).replace(/\\/g, '/');
         docxUrl  = `${baseUrl}/uploads/${docxRel}`;
         docxPath = docxRel;
@@ -1065,47 +1580,22 @@ app.post('/api/server-records/:safeSerie/:sessionTs/regenerate', requireAccessKe
     const sourcePath = path.join(sessionDir, 'laporan_source.html');
     const metaPath   = path.join(sessionDir, 'meta.json');
 
+    const { meta, docMeta, docxBlocks } = buildSessionDocxData(safeSerie, sessionTs, baseUrl);
     let fullHtmlDoc = null;
-    let meta        = null;
 
-    if (fs.existsSync(metaPath)) {
-      try { meta = JSON.parse(fs.readFileSync(metaPath, 'utf8')); } catch (_) {}
-    }
-
-    if (meta && Array.isArray(meta.bloks)) {
-      const rows = meta.bloks.map((b) => {
+    if (docxBlocks.length > 0 || meta) {
+      const rows = docxBlocks.map((b) => {
         const imagePaths = (b.slots || []).map(s =>
-          s.imageRelPath ? { relPath: s.imageRelPath, width: s.width || 0, height: s.height || 0 } : null
+          s.relPath ? { relPath: s.relPath, width: s.width || 0, height: s.height || 0 } : null
         );
         return generateBase6Grid(b, imagePaths, baseUrl);
       }).join('\n');
-      fullHtmlDoc = buildFullHtmlDoc(meta, rows);
+      fullHtmlDoc = buildFullHtmlDoc(docMeta, rows);
       fs.writeFileSync(sourcePath, fullHtmlDoc, 'utf8');
     } else if (fs.existsSync(sourcePath)) {
       fullHtmlDoc = fs.readFileSync(sourcePath, 'utf8');
     } else {
-      const summary = readServerSessionSummary(safeSerie, sessionTs, baseUrl) || {
-        namaPerusahaan: `Laporan (SN: ${safeSerie})`,
-        jenisObjek:     'Dokumentasi Riksa Uji',
-        noSerie:        safeSerie
-      };
-      const blokDirs = fs.readdirSync(sessionDir)
-        .filter(f => /^blok_\d+$/i.test(f) && fs.statSync(path.join(sessionDir, f)).isDirectory())
-        .sort((a, b) => parseInt(a.split('_')[1], 10) - parseInt(b.split('_')[1], 10));
-
-      const rows = blokDirs.map((bDir, idx) => {
-        const bPath = path.join(sessionDir, bDir);
-        const imgs  = fs.readdirSync(bPath).filter(f => /\.(jpg|jpeg|png)$/i.test(f)).sort();
-        const layout = imgs.length >= 3 ? '3col' : imgs.length === 2 ? '2col' : '1col';
-        const rels   = imgs.map(f => `${safeSerie}/${sessionTs}/${bDir}/${f}`);
-        const blok   = {
-          judul:  `Pemeriksaan ${idx + 1}`,
-          layout,
-          slots:  rels.map(() => ({ keterangan: '' }))
-        };
-        return generateBase6Grid(blok, rels, baseUrl);
-      }).join('\n');
-      fullHtmlDoc = buildFullHtmlDoc(summary, rows);
+      fullHtmlDoc = buildFullHtmlDoc(docMeta, '');
     }
 
     const pdfFilename  = `laporan_${safeSerie}_${sessionTs}.pdf`;
@@ -1124,7 +1614,7 @@ app.post('/api/server-records/:safeSerie/:sessionTs/regenerate', requireAccessKe
     }
 
     try {
-      await generateDocx(fullHtmlDoc, docxAbsPath);
+      await generateDocx(docMeta, docxBlocks, docxAbsPath);
     } catch (e) {
       docxError = e.message;
       console.warn('[Regenerate DOCX] Failed:', e.message);

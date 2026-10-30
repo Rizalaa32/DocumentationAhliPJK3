@@ -5,12 +5,12 @@
 
 const swSelf = /** @type {ServiceWorkerGlobalScope} */ (/** @type {unknown} */ (self));
 
-const CACHE_NAME = 'riksauji-v22';
+const CACHE_NAME = 'riksauji-v23';
 const STATIC_ASSETS = [
   '/',
   '/index.html',
   '/app.js',
-  '/app.js?v=22',
+  '/app.js?v=23',
   '/manifest.json',
   '/icons/icon-192.png',
   '/icons/icon-512.png'
